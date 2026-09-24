@@ -17,6 +17,8 @@ from pathlib import Path
 import tkinter as tk
 from tkinter import filedialog, messagebox
 
+# Media Foundation öffnet Capture-Cards sonst teils sehr langsam / gar nicht
+os.environ.setdefault("OPENCV_VIDEOIO_MSMF_ENABLE_HW_TRANSFORMS", "0")
 import cv2
 import numpy as np
 import customtkinter as ctk
@@ -37,6 +39,16 @@ else:
 CONFIG_FILE = APP_DIR / "config.json"
 
 RESOLUTIONS = ["3840x2160", "2560x1440", "1920x1080", "1280x720"]
+# Videomodi: (Backend, FourCC). "Auto" probiert der Reihe nach, bis ein echtes Bild kommt.
+MODES = {
+    "DirectShow · MJPG": (cv2.CAP_DSHOW, "MJPG"),
+    "DirectShow · YUY2": (cv2.CAP_DSHOW, "YUY2"),
+    "DirectShow · NV12": (cv2.CAP_DSHOW, "NV12"),
+    "DirectShow · Standard": (cv2.CAP_DSHOW, None),
+    "Media Foundation": (cv2.CAP_MSMF, None),
+}
+MODE_AUTO = "Auto"
+AUTO_CHECK_MS = 5000  # so lange wird pro Modus auf ein Bild gewartet
 EXCEL_HEADERS = ["Datum", "Uhrzeit", "Hersteller", "Leiterplatte / Artikel-Nr.",
                  "Serien-/Auftrags-Nr.", "Schadensbeschreibung", "Bearbeiter",
                  "Dateiname", "Link", "Vorschau"]
@@ -66,6 +78,7 @@ DEFAULT_CONFIG = {
     "bearbeiter": os.environ.get("USERNAME", ""),
     "hersteller_history": [],
     "appearance": "Dark",
+    "video_mode": MODE_AUTO,
 }
 
 
@@ -106,6 +119,12 @@ def safe_name(text):
     return re.sub(r"\s+", "_", text)[:40]
 
 
+def is_black(frame):
+    """True, wenn das Bild praktisch komplett schwarz/einfarbig ist (kein Signal)."""
+    small = cv2.resize(frame, (64, 36), interpolation=cv2.INTER_AREA)
+    return small.mean() < 6 or small.std() < 2
+
+
 def mode_color(pair):
     return pair[1] if ctk.get_appearance_mode() == "Dark" else pair[0]
 
@@ -113,13 +132,16 @@ def mode_color(pair):
 class CameraThread(threading.Thread):
     """Liest fortlaufend Frames, damit immer das aktuellste Bild in voller Auflösung bereitliegt."""
 
-    def __init__(self, index, width, height):
+    def __init__(self, index, width, height, backend=cv2.CAP_DSHOW, fourcc="MJPG"):
         super().__init__(daemon=True)
-        self.cap = cv2.VideoCapture(index, cv2.CAP_DSHOW)
-        # MJPG erlaubt bei den meisten Capture-Cards hohe Auflösung mit brauchbarer Bildrate
-        self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*"MJPG"))
+        self.cap = cv2.VideoCapture(index, backend)
+        if fourcc:
+            self.cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+        self.cap.set(cv2.CAP_PROP_FPS, 30)
+        self.mode_name = ""
+        self.got_signal = False  # mindestens ein echtes (nicht schwarzes) Bild empfangen
         self.lock = threading.Lock()
         self.frame = None
         self.fps = 0.0
@@ -137,6 +159,8 @@ class CameraThread(threading.Thread):
             if ok:
                 with self.lock:
                     self.frame = frame
+                if not self.got_signal and not is_black(frame):
+                    self.got_signal = True
                 count += 1
                 if time.time() - t0 >= 1.0:
                     self.fps = count / (time.time() - t0)
@@ -258,6 +282,14 @@ class App:
                                           command=lambda _: self.start_camera())
         self.res_menu.set(self.cfg["resolution"])
         self.res_menu.pack(side="right")
+        row = ctk.CTkFrame(b, fg_color="transparent")
+        row.pack(fill="x", pady=(8, 0))
+        ctk.CTkLabel(row, text="Videomodus", text_color=MUTED).pack(side="left")
+        self.mode_menu = ctk.CTkOptionMenu(row, values=[MODE_AUTO] + list(MODES), width=190,
+                                           dynamic_resizing=False, command=lambda _: self.start_camera())
+        self.mode_menu.set(self.cfg.get("video_mode", MODE_AUTO)
+                           if self.cfg.get("video_mode") in MODES else MODE_AUTO)
+        self.mode_menu.pack(side="right")
 
         # Speicherort
         card = Card(side, "Speicherort", "📁")
@@ -367,24 +399,62 @@ class App:
         v = self.cam_menu.get()
         return int(v.split(":")[0]) if v and v[0].isdigit() else None
 
-    def start_camera(self):
+    def stop_camera(self):
         if self.cam:
             self.cam.stop()
-            self.cam.join(timeout=2)
+            self.cam.join(timeout=3)
             self.cam = None
+
+    def start_camera(self):
+        self._gen = getattr(self, "_gen", 0) + 1   # bricht laufende Auto-Suche ab
+        self.stop_camera()
+        if self.selected_index() is None:
+            return
+        mode = self.mode_menu.get()
+        if mode == MODE_AUTO:
+            self._auto_try(list(MODES), self._gen)
+        else:
+            self._open_mode(mode)
+            self.set_status(f"Kamera läuft ({mode}) – bereit für Aufnahmen.")
+
+    def _open_mode(self, mode):
         idx = self.selected_index()
-        if idx is None:
-            return
         w, h = map(int, self.res_menu.get().split("x"))
-        self.set_status("Starte Kamera…")
+        backend, fourcc = MODES[mode]
+        self.set_status(f"Starte Kamera ({mode})…")
         self.root.update_idletasks()
-        cam = CameraThread(idx, w, h)
+        cam = CameraThread(idx, w, h, backend, fourcc)
+        cam.mode_name = mode
         if not cam.running:
-            self.set_status(f"Kamera {idx} konnte nicht geöffnet werden.", ERR)
-            return
+            self.set_status(f"Kamera {idx} konnte mit {mode} nicht geöffnet werden.", ERR)
+            return False
         cam.start()
         self.cam = cam
-        self.set_status("Kamera läuft – bereit für Aufnahmen.")
+        return True
+
+    def _auto_try(self, queue, gen):
+        """Probiert die Videomodi nacheinander, bis ein echtes (nicht schwarzes) Bild kommt."""
+        if gen != self._gen:
+            return
+        self.stop_camera()
+        if not queue:
+            self._open_mode(next(iter(MODES)))
+            self.set_status("Kein Bildsignal in allen Videomodi – HDMI-Quelle, Kabel und "
+                            "Auflösung des Mikroskops prüfen (siehe Diagnose).", WARN)
+            return
+        mode, rest = queue[0], queue[1:]
+        if not self._open_mode(mode):
+            self.root.after(10, lambda: self._auto_try(rest, gen))
+            return
+
+        def check():
+            if gen != self._gen or not self.cam:
+                return
+            if self.cam.got_signal:
+                self.set_status(f"Kamera läuft (Auto → {mode}) – bereit für Aufnahmen.", OK_GREEN)
+            else:
+                self._auto_try(rest, gen)
+        self.root.after(AUTO_CHECK_MS, check)
 
     def update_preview(self):
         c = self.canvas
@@ -404,7 +474,7 @@ class App:
             # Info-Badges
             aw, ah = self.cam.actual_size
             x = self._badge(16, 14, "●  LIVE", "#dc2626")
-            self._badge(x + 22, 14, f"{aw} × {ah}   ·   {self.cam.fps:4.1f} fps", "#111827")
+            self._badge(x + 22, 14, f"{aw} × {ah}   ·   {self.cam.fps:4.1f} fps   ·   {self.cam.mode_name}", "#111827")
         else:
             txt = "Warte auf Bild…" if self.cam else "Keine Kamera aktiv\nCapture-Card wählen und ↻ drücken"
             c.create_text(cw // 2, ch // 2, text=txt, fill=mode_color(MUTED),
@@ -495,6 +565,7 @@ class App:
         self.cfg.update(
             camera_index=self.selected_index() or 0,
             resolution=self.res_menu.get(),
+            video_mode=self.mode_menu.get(),
             save_dir=self.dir_var.get(),
             excel_name=self.excel_name_var.get().strip() or DEFAULT_CONFIG["excel_name"],
             excel_enabled=self.excel_var.get(),
@@ -633,9 +704,8 @@ class App:
 
     def on_close(self):
         self.persist()
-        if self.cam:
-            self.cam.stop()
-            self.cam.join(timeout=2)
+        self._gen = -1
+        self.stop_camera()
         self.root.destroy()
 
 
