@@ -1,0 +1,6 @@
+opencv-python
+pillow
+openpyxl
+pygrabber
+customtkinter
+numpy
