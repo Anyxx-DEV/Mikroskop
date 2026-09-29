@@ -317,14 +317,19 @@ class App:
 
         self.banner = ctk.CTkFrame(left, fg_color=("#FEF2F2", "#3B1219"), corner_radius=10,
                                    border_width=1, border_color=ERR)
-        ctk.CTkLabel(self.banner, text="", image=ctk_icon("warning", 20, ERR)).pack(side="left", padx=(14, 8), pady=10)
-        self.banner_text = ctk.CTkLabel(self.banner, text="", text_color=FG, font=F(13), anchor="w",
-                                        justify="left", wraplength=700)
-        self.banner_text.pack(side="left", fill="x", expand=True, pady=10)
-        button(self.banner, "Ordner wählen", self.choose_dir, kind="ghost", height=32).pack(side="right", padx=(6, 12))
-        button(self.banner, " Erneut prüfen", self.check_server, icon="refresh", height=32).pack(side="right")
-        button(self.banner, " Am Server anmelden", self.server_login, icon="folder", kind="primary",
-               height=32, width=200).pack(side="right", padx=(0, 6))
+        # Buttons in eigener Zeile, damit langer Fehlertext sie nicht verdrängt
+        top = ctk.CTkFrame(self.banner, fg_color="transparent")
+        top.pack(fill="x", padx=14, pady=(12, 0))
+        ctk.CTkLabel(top, text="", image=ctk_icon("warning", 20, ERR)).pack(side="left", anchor="n", padx=(0, 10))
+        self.banner_text = ctk.CTkLabel(top, text="", text_color=FG, font=F(13), anchor="w",
+                                        justify="left", wraplength=900)
+        self.banner_text.pack(side="left", fill="x", expand=True)
+        btns = ctk.CTkFrame(self.banner, fg_color="transparent")
+        btns.pack(fill="x", padx=44, pady=(10, 12))
+        button(btns, " Am Server anmelden", self.server_login, icon="folder", kind="primary",
+               height=34, width=200).pack(side="left")
+        button(btns, " Erneut prüfen", self.check_server, icon="refresh", height=34).pack(side="left", padx=8)
+        button(btns, "Ordner wählen", self.choose_dir, kind="ghost", height=34).pack(side="left")
 
         self.pv = pv = ctk.CTkFrame(left, fg_color=PREVIEW_BG, corner_radius=12, border_width=1, border_color=BORDER)
         pv.grid(row=1, column=0, sticky="nsew")
@@ -1188,9 +1193,17 @@ class App:
         else:
             self.server_info.configure(text="  Kein Schreibzugriff – Details oben", image=ctk_icon("warning", 14, ERR),
                                        text_color=ERR)
+            # typische Fälle verständlich erklären
+            if any(c in err for c in ("1272", "1326", "WinError 5]", "WinError 86]")):
+                hint = ("Dieser PC ist nicht am Server angemeldet (Windows versucht einen gesperrten Gastzugriff).\n"
+                        "→ Auf „Am Server anmelden“ klicken, Passwort eingeben, „Verbinden“ – nur einmal nötig.")
+            elif "53]" in err or "67]" in err:
+                hint = "Server nicht erreichbar – Netzwerkkabel/WLAN bzw. VPN prüfen, dann „Erneut prüfen“."
+            else:
+                hint = "Netzwerk, Laufwerk N: und Schreibrechte des Windows-Benutzers prüfen."
             self.banner_text.configure(
                 text=f"Speicherort nicht beschreibbar – Bilder können so nicht gespeichert werden.\n"
-                     f"{d}\nGrund: {err}\nNetzwerk/VPN, Laufwerk N: und Schreibrechte des Windows-Benutzers prüfen.")
+                     f"{hint}\n\n{d}\nTechnischer Grund: {err.split(':')[0]}")
             if not self._fullscreen:
                 self.banner.grid(row=0, column=0, sticky="ew", pady=(0, 10))
             self.set_status("Speicherort nicht beschreibbar – siehe Hinweis oben.", ERR)
