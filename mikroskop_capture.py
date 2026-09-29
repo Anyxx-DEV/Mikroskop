@@ -10,7 +10,6 @@ und Eintrag in eine Excel-Liste.
 import json
 import math
 import os
-import re
 import sys
 import threading
 import time
@@ -29,19 +28,15 @@ from PIL import Image, ImageTk
 import ui
 import overlay
 import netdrive
+import sqldb
+import storage
+import report
+from storage import log, safe_name
 from annotate import AnnotateDialog
 from icons import ctk_icon, pil_icon
 from ui import (BG, CARD, FIELD, BORDER, BORDER_STRONG, FG, MUTED, SECONDARY, SECONDARY_HOVER, ACCENT,
                 ACCENT_HOVER, ON_ACCENT, PREVIEW_BG, OK_GREEN, WARN, ERR, F, Card, button, entry, option,
                 switch, field_label, keycap, focus_ring, set_error, error_label, set_toggle, mode_color, ask_form)
-
-try:
-    from openpyxl import Workbook, load_workbook
-    from openpyxl.drawing.image import Image as XLImage
-    from openpyxl.styles import Font, PatternFill, Alignment
-    from openpyxl.utils import get_column_letter
-except ImportError:
-    Workbook = None
 
 APP_NAME = "Mikroskop-Capture"
 if getattr(sys, "frozen", False):
@@ -64,14 +59,8 @@ AUTO_CHECK_MS = 5000     # so lange wird pro Modus auf ein Bild gewartet
 LOST_AFTER_S = 3.0       # so lange ohne Bild -> Verbindung gilt als unterbrochen
 OVERRIDE_S = 6.0         # Pflichtfeld-Warnung: erneutes F9 innerhalb dieser Zeit speichert trotzdem
 
-# Excel-Spalten (Name, Breite). Vorhandene Listen werden anhand der Überschriften zugeordnet,
-# fehlende Spalten werden hinten angefügt.
-EXCEL_COLUMNS = [("Datum", 11), ("Uhrzeit", 9), ("Fall-Nr.", 16), ("Bild-Nr.", 8), ("Hersteller", 18),
-                 ("Leiterplatte / Artikel-Nr.", 22), ("Serien-/Auftrags-Nr.", 18), ("Fehlerart", 22),
-                 ("Schadensbeschreibung", 40), ("Vergrößerung", 14), ("Bearbeiter", 14), ("Dateiname", 44),
-                 ("Link", 11), ("Vorschau", 22)]
-THUMB_HEIGHT = 90   # px, Vorschaubild in Excel
 STRIP_COUNT = 8     # letzte Aufnahmen in der Leiste
+RETRY_MS = 60_000   # Offline-Puffer: so oft wird das Nachtragen versucht
 IMAGE_EXTS = (".png", ".jpg", ".jpeg")
 NO_FEHLERART = "– keine Angabe –"
 NOT_CALIBRATED = "Nicht kalibriert"
@@ -96,7 +85,6 @@ DEFAULT_CONFIG = {
     "excel_thumbnail": True,
     "image_format": "png",
     "bearbeiter": os.environ.get("USERNAME", ""),
-    "hersteller_history": [],
     "appearance": "Dark",
     "video_mode": MODE_AUTO,
     "fehlerarten": DEFAULT_FEHLERARTEN,
@@ -109,6 +97,10 @@ DEFAULT_CONFIG = {
     "live_scale": True,
     "server_user": r"se-elektronic.local\smd",   # Domänen-Benutzer; das Passwort wird nie hier gespeichert
     "server_drive": "N:",
+    # SQL Server (nur lesend) - das Passwort liegt in der Windows-Anmeldeinformationsverwaltung
+    "sql": {"server": r"W2K19-SRV16\BW71", "database": "SE_Tools", "user": "Tapi"},
+    # Bildanpassung in Software (Helligkeit -100..100, Kontrast/Sättigung 0.5..2, Weißabgleich B/G/R)
+    "image_adjust": dict(overlay.DEFAULT_ADJUST),
 }
 
 
@@ -120,6 +112,10 @@ def load_config():
         pass
     if os.path.normcase(cfg["save_dir"]) == os.path.normcase(OLD_DEFAULT_DIR):
         cfg["save_dir"] = SERVER_DIR   # alte Standard-Einstellung auf den Server umstellen
+    sql = cfg.setdefault("sql", {})
+    for k, v in DEFAULT_CONFIG["sql"].items():   # leere SQL-Felder mit den Vorgaben füllen
+        if not sql.get(k):
+            sql[k] = v
     if cfg.get("server_user") == "smd":
         cfg["server_user"] = DEFAULT_CONFIG["server_user"]   # Anmeldung braucht den Domänen-Benutzer
     return cfg
@@ -129,7 +125,7 @@ def save_config(cfg):
     try:
         CONFIG_FILE.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception as e:
-        print("Config konnte nicht gespeichert werden:", e)
+        log.error("Config konnte nicht gespeichert werden: %s", e)
 
 
 def list_cameras():
@@ -148,23 +144,10 @@ def list_cameras():
         return found
 
 
-def safe_name(text):
-    text = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", text.strip())
-    return re.sub(r"\s+", "_", text)[:40]
-
-
 def is_black(frame):
     """True, wenn das Bild praktisch komplett schwarz/einfarbig ist (kein Signal)."""
     small = cv2.resize(frame, (64, 36), interpolation=cv2.INTER_AREA)
     return small.mean() < 6 or small.std() < 2
-
-
-def hide_dir(path):
-    try:
-        import ctypes
-        ctypes.windll.kernel32.SetFileAttributesW(str(path), 0x02)
-    except Exception:
-        pass
 
 
 def new_case_id():
@@ -225,7 +208,16 @@ class App:
     def __init__(self, root):
         ui.init_fonts()
         self.root = root
+        self.log_path = storage.setup_logging(APP_DIR)
         self.cfg = load_config()
+        log.info("===== Programmstart (Benutzer %s, PC %s) =====", os.environ.get("USERNAME"),
+                 os.environ.get("COMPUTERNAME"))
+        # unerwartete Fehler ins Log schreiben statt still zu verschwinden
+        root.report_callback_exception = lambda *exc: log.error("Unerwarteter Fehler", exc_info=exc)
+        threading.excepthook = lambda a: log.error("Fehler im Hintergrund-Thread",
+                                                   exc_info=(a.exc_type, a.exc_value, a.exc_traceback))
+        self.store = storage.Store(on_change=lambda n: self.root.after(0, lambda: self._update_buffer_badge(n)))
+        self._retrying = False
         self._canvas_icons = {}
         self.cam = None
         self.cameras = []
@@ -262,6 +254,8 @@ class App:
         self.refresh_cameras()
         self.start_camera()
         self.check_server()
+        self._update_buffer_badge(self.store.pending_count())
+        self.root.after(RETRY_MS, self._retry_timer)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.update_preview()
         self.root.after(1000, self._watchdog)
@@ -308,6 +302,11 @@ class App:
                                         compound="left", fg_color=SECONDARY, corner_radius=16, height=32,
                                         text_color=FG, font=F(12, "bold"), padx=12)
         self.count_label.pack(side="right", padx=12)
+        # Offline-Puffer: nur sichtbar, wenn etwas auf das Nachtragen wartet (Klick = jetzt versuchen)
+        self.buffer_label = ctk.CTkLabel(header, text="", image=ctk_icon("refresh", 16, WARN), compound="left",
+                                         fg_color=("#FEF3C7", "#422006"), corner_radius=16, height=32,
+                                         text_color=WARN, font=F(12, "bold"), padx=12, cursor="hand2")
+        self.buffer_label.bind("<Button-1>", lambda e: self.retry_buffer(manual=True))
 
         # ---- Links: Hinweis-Banner + Vorschau + letzte Aufnahmen ----
         self.left = left = ctk.CTkFrame(r, fg_color="transparent")
@@ -377,7 +376,9 @@ class App:
         self._build_board_card(side)
         self._build_measure_card(side)
         self._build_camera_card(side)
+        self._build_image_card(side)
         self._build_storage_card(side)
+        self._build_sql_card(side)
 
         # ---- Aufnahme-Button (immer sichtbar) ----
         self.cap_frame = cap = ctk.CTkFrame(r, fg_color="transparent")
@@ -411,39 +412,80 @@ class App:
         self.case_label = ctk.CTkLabel(b, text="", fg_color=SECONDARY, corner_radius=12, height=26,
                                        text_color=FG, font=F(12, "bold", ui.FONT_MONO), padx=10)
         self.case_label.pack(anchor="w", pady=(8, 0))
-        self.hersteller_var = tk.StringVar()
         self.artikel_var = tk.StringVar()
-        self.serie_var = tk.StringVar()
+        self.fa_var = tk.StringVar()
         self.bearbeiter_var = tk.StringVar(value=self.cfg["bearbeiter"])
 
-        field_label(b, "Hersteller", required=True)
-        self.hersteller_combo = focus_ring(ctk.CTkComboBox(
-            b, variable=self.hersteller_var, values=self.cfg["hersteller_history"] or [""], height=36,
-            corner_radius=8, fg_color=FIELD, border_color=BORDER_STRONG, border_width=1,
-            button_color=SECONDARY, button_hover_color=SECONDARY_HOVER, text_color=FG,
-            dropdown_fg_color=CARD, dropdown_hover_color=SECONDARY, dropdown_text_color=FG,
-            font=F(13), dropdown_font=F(13)))
-        self.hersteller_combo.pack(fill="x")
-        self.hersteller_err = error_label(b)
-        self.hersteller_var.set("")
+        # Fertigungsauftrag (Bel_Nr): Enter (oder Scanner) lädt Platinen-Nr. + Bezeichnung aus dem SQL Server
+        field_label(b, "Fertigungsauftrag (Bel_Nr)   –   Enter = aus Datenbank laden", required=True)
+        row = ctk.CTkFrame(b, fg_color="transparent")
+        row.pack(fill="x")
+        self.fa_entry = entry(row, self.fa_var)
+        self.fa_entry.pack(side="left", fill="x", expand=True)
+        fa_btn = button(row, "", self.lookup_auftrag, icon="search", width=36)
+        fa_btn.pack(side="left", padx=(8, 0))
+        # Vorschläge aus der Datenbank schon beim Tippen
+        self.fa_suggest = ui.SuggestPopup(self.fa_entry, self._pick_suggestion, width_widget=fa_btn)
+        self._suggest_job = None
+        self._suggest_seq = 0
+        for seq, fn in (("<Return>", self._fa_return), ("<KP_Enter>", self._fa_return),
+                        ("<Down>", lambda e: self._fa_nav(1)), ("<Up>", lambda e: self._fa_nav(-1)),
+                        ("<Escape>", lambda e: self.fa_suggest.hide()), ("<KeyRelease>", self._fa_typed),
+                        ("<FocusOut>", lambda e: self.root.after(250, self._fa_focus_lost))):
+            self.fa_entry.bind(seq, fn, add="+")
+        self.root.bind("<Configure>", lambda e: self.fa_suggest.hide() if e.widget is self.root else None, add="+")
+        self.fa_err = error_label(b)
+        self.fa_info = ctk.CTkLabel(b, text="", text_color=OK_GREEN, font=F(12), anchor="w", height=18)
 
+        self.artikeltext_var = tk.StringVar()
         grid = ctk.CTkFrame(b, fg_color="transparent")
         grid.pack(fill="x")
-        grid.grid_columnconfigure((0, 1), weight=1, uniform="c")
+        grid.grid_columnconfigure(0, weight=2, uniform="c")
+        grid.grid_columnconfigure(1, weight=3, uniform="c")
         cell = ctk.CTkFrame(grid, fg_color="transparent")
         cell.grid(row=0, column=0, sticky="new", padx=(0, 6))
-        field_label(cell, "Artikel-Nr.", required=True)
+        field_label(cell, "Platinen-Nr.")
         self.artikel_entry = entry(cell, self.artikel_var)
         self.artikel_entry.pack(fill="x")
-        self.artikel_err = error_label(cell)
         cell = ctk.CTkFrame(grid, fg_color="transparent")
         cell.grid(row=0, column=1, sticky="new", padx=(6, 0))
-        field_label(cell, "Serien-/Auftrags-Nr.")
-        entry(cell, self.serie_var).pack(fill="x")
+        field_label(cell, "Artikelbezeichnung")
+        entry(cell, self.artikeltext_var).pack(fill="x")
+        self.artikel_entry.bind("<Return>", lambda e: self.load_bauteile(), add="+")
 
-        self._required = [(self.hersteller_var, self.hersteller_combo, self.hersteller_err, "Hersteller"),
-                          (self.artikel_var, self.artikel_entry, self.artikel_err, "Artikel-Nr.")]
-        for var, widget, lbl, _ in self._required:
+        # Bauteil aus der Stückliste (wird nach dem Laden der Platinen-Nr. gefüllt, Tippen filtert)
+        field_label(b, "Bauteil (aus Stückliste)  –  tippen zum Filtern")
+        self.bauteil_var = tk.StringVar()
+        self._bauteile = []
+        self.bauteil_combo = focus_ring(ctk.CTkComboBox(
+            b, variable=self.bauteil_var, values=[""], height=36, corner_radius=8, fg_color=FIELD,
+            border_color=BORDER_STRONG, border_width=1, button_color=SECONDARY, button_hover_color=SECONDARY_HOVER,
+            text_color=FG, dropdown_fg_color=CARD, dropdown_hover_color=SECONDARY, dropdown_text_color=FG,
+            font=F(13), dropdown_font=F(12)))
+        self.bauteil_combo.pack(fill="x")
+        # Vorschläge beim Tippen (wie beim Fertigungsauftrag), gesucht wird in der geladenen Stückliste
+        self.bauteil_suggest = ui.SuggestPopup(self.bauteil_combo, self._pick_bauteil)
+        for seq, fn in (("<KeyRelease>", self._filter_bauteile), ("<Return>", self._bauteil_return),
+                        ("<KP_Enter>", self._bauteil_return),
+                        ("<Down>", lambda e: self._bauteil_nav(1)), ("<Up>", lambda e: self._bauteil_nav(-1)),
+                        ("<Escape>", lambda e: self.bauteil_suggest.hide()),
+                        ("<FocusOut>", lambda e: self.root.after(250, self._bauteil_focus_lost))):
+            self.bauteil_combo.bind(seq, fn, add="+")
+        self.root.bind("<Configure>", lambda e: self.bauteil_suggest.hide() if e.widget is self.root else None,
+                       add="+")
+        self.bauteil_var.set("")
+        self.bauteil_info = ctk.CTkLabel(b, text="Wird nach dem Laden des Fertigungsauftrags bzw. der Platinen-Nr. gefüllt.",
+                                         text_color=MUTED, font=F(12), anchor="w", justify="left", wraplength=340)
+        self.bauteil_info.pack(fill="x", pady=(4, 0))
+        # Details des gewählten Bauteils (Gehäuse, Technologie, Typ) aus der Stückliste
+        self._bauteil_details = {}
+        self.bauteil_detail = ctk.CTkLabel(b, text="", text_color=FG, fg_color=SECONDARY, corner_radius=8,
+                                           font=F(12), anchor="w", justify="left", wraplength=330, padx=10)
+        self.bauteil_var.trace_add("write", lambda *a: self._show_bauteil_detail())
+
+        # Pflichtfelder: (Variable, Feld, Fehlertext-Label, Name, Element hinter dem der Hinweis erscheint)
+        self._required = [(self.fa_var, self.fa_entry, self.fa_err, "Fertigungsauftrag", self.fa_entry.master)]
+        for var, widget, lbl, _, _ in self._required:
             var.trace_add("write", lambda *a, v=var, w=widget, l=lbl: v.get().strip() and set_error(w, l, None))
 
         field_label(b, "Fehlerart  (F6 wechselt)")
@@ -458,7 +500,13 @@ class App:
         self.desc_text.pack(fill="x")
         field_label(b, "Bearbeiter")
         entry(b, self.bearbeiter_var).pack(fill="x")
-        button(b, " Neuer Fall  (F7)", self.new_case, icon="plus", kind="ghost").pack(fill="x", pady=(14, 0))
+        row = ctk.CTkFrame(b, fg_color="transparent")
+        row.pack(fill="x", pady=(14, 0))
+        row.grid_columnconfigure((0, 1), weight=1, uniform="c")
+        button(row, " Neuer Fall  (F7)", self.new_case, icon="plus", kind="ghost").grid(
+            row=0, column=0, sticky="ew", padx=(0, 4))
+        button(row, " PDF-Bericht (FA)", self.make_pdf_report, icon="clipboard", kind="ghost").grid(
+            row=0, column=1, sticky="ew", padx=(4, 0))
         self._update_case_label()
 
     def _build_measure_card(self, side):
@@ -510,6 +558,94 @@ class App:
         self.mode_menu.set(self.cfg.get("video_mode", MODE_AUTO)
                            if self.cfg.get("video_mode") in MODES else MODE_AUTO)
 
+    def _build_image_card(self, side):
+        """Helligkeit, Kontrast, Sättigung, Weißabgleich - in Software, wirkt auf Vorschau und Foto."""
+        card = Card(side, "Bildeinstellungen", "sliders")
+        card.pack(fill="x", pady=(0, 12))
+        b = card.body
+        adj = self.cfg.setdefault("image_adjust", dict(overlay.DEFAULT_ADJUST))
+        self._adj_sliders = {}
+        for key, label, lo, hi, steps, fmt in (("brightness", "Helligkeit", -100, 100, 200, "{:+.0f}"),
+                                                 ("contrast", "Kontrast", 0.5, 2.0, 150, "{:.2f}×"),
+                                                 ("saturation", "Sättigung", 0.0, 2.0, 200, "{:.2f}×")):
+            row = ctk.CTkFrame(b, fg_color="transparent")
+            row.pack(fill="x", pady=(10, 0))
+            ctk.CTkLabel(row, text=label, text_color=MUTED, font=F(12, "bold"), width=80, anchor="w").pack(side="left")
+            val = ctk.CTkLabel(row, text="", text_color=FG, font=F(12, family=ui.FONT_MONO), width=56, anchor="e")
+            val.pack(side="right")
+            s = ctk.CTkSlider(row, from_=lo, to=hi, number_of_steps=steps, progress_color=ACCENT,
+                              button_color=("#FFFFFF", "#F8FAFC"), button_hover_color=ACCENT,
+                              command=lambda v, k=key, l=val, f=fmt: self._adj_changed(k, v, l, f))
+            s.pack(side="left", fill="x", expand=True, padx=8)
+            s.set(adj.get(key, overlay.DEFAULT_ADJUST[key]))
+            val.configure(text=fmt.format(s.get()))
+            self._adj_sliders[key] = (s, val, fmt)
+        self.wb_info = ctk.CTkLabel(b, text="", text_color=MUTED, font=F(12), anchor="w")
+        self.wb_info.pack(fill="x", pady=(10, 0))
+        self._update_wb_info()
+        row = ctk.CTkFrame(b, fg_color="transparent")
+        row.pack(fill="x", pady=(6, 0))
+        row.grid_columnconfigure((0, 1), weight=1, uniform="c")
+        button(row, " Weißabgleich messen", self.measure_wb, icon="crosshair").grid(
+            row=0, column=0, sticky="ew", padx=(0, 4))
+        button(row, " Zurücksetzen", self.reset_adjust, icon="undo", kind="ghost").grid(
+            row=0, column=1, sticky="ew", padx=(4, 0))
+        button(b, " Treiber-Einstellungen der Capture-Card", self.open_driver_settings, icon="video",
+               kind="ghost").pack(fill="x", pady=(8, 0))
+        ctk.CTkLabel(b, text="Weißabgleich: weißes Blatt / graue Fläche in die Bildmitte legen, dann messen.",
+                     text_color=MUTED, font=F(11), anchor="w", justify="left", wraplength=340).pack(fill="x", pady=(6, 0))
+
+    def _adj_changed(self, key, value, label, fmt):
+        self.cfg["image_adjust"][key] = round(float(value), 2)
+        label.configure(text=fmt.format(value))
+        self._schedule_save()
+
+    def _schedule_save(self):
+        if getattr(self, "_save_job", None):
+            self.root.after_cancel(self._save_job)
+        self._save_job = self.root.after(1500, lambda: save_config(self.cfg))
+
+    def _update_wb_info(self):
+        b, g, r = self.cfg["image_adjust"].get("wb", [1, 1, 1])
+        self.wb_info.configure(text="Weißabgleich: neutral" if [b, g, r] == [1, 1, 1]
+                               else f"Weißabgleich: Blau {b:.2f}×  ·  Rot {r:.2f}×")
+
+    def measure_wb(self):
+        frame = self.cam.get_frame() if self.cam else None
+        if frame is None:
+            self.set_status("Für den Weißabgleich wird ein Live-Bild benötigt.", ERR)
+            return
+        self.cfg["image_adjust"]["wb"] = overlay.measure_white_balance(frame)
+        self._update_wb_info()
+        save_config(self.cfg)
+        log.info("Weißabgleich gemessen: %s", self.cfg["image_adjust"]["wb"])
+        self.toast("Weißabgleich übernommen", OK_GREEN)
+
+    def reset_adjust(self):
+        self.cfg["image_adjust"] = dict(overlay.DEFAULT_ADJUST)
+        for key, (s, val, fmt) in self._adj_sliders.items():
+            s.set(overlay.DEFAULT_ADJUST[key])
+            val.configure(text=fmt.format(s.get()))
+        self._update_wb_info()
+        save_config(self.cfg)
+        self.toast("Bildeinstellungen zurückgesetzt", OK_GREEN)
+
+    def open_driver_settings(self):
+        """Einstellungsdialog des Kameratreibers (nur DirectShow und nur, wenn die Karte einen anbietet)."""
+        cam = self.cam
+        if not cam or not cam.mode_name.startswith("DirectShow"):
+            self.set_status("Treiber-Einstellungen gibt es nur im Videomodus „DirectShow“.", WARN)
+            return
+
+        def work():
+            ok = cam.cap.set(cv2.CAP_PROP_SETTINGS, 1)
+            if not ok:
+                self.root.after(0, lambda: self.set_status(
+                    "Die Capture-Card bietet keinen eigenen Einstellungsdialog – bitte die Regler oben verwenden.",
+                    WARN))
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _build_storage_card(self, side):
         card = Card(side, "Speicherort", "folder")
         card.pack(fill="x", pady=(0, 12))
@@ -546,6 +682,116 @@ class App:
         field_label(b, "Excel-Datei")
         self.excel_name_var = tk.StringVar(value=self.cfg["excel_name"])
         entry(b, self.excel_name_var).pack(fill="x")
+        ctk.CTkLabel(b, text="Bilder werden je Fertigungsauftrag in einem Unterordner abgelegt "
+                             "(z. B. …\\81678\\). Die Excel-Liste liegt im Hauptordner.",
+                     text_color=MUTED, font=F(11), anchor="w", justify="left", wraplength=340).pack(fill="x", pady=(8, 0))
+        button(b, " Log-Datei öffnen", self.open_log, icon="clipboard", kind="ghost").pack(fill="x", pady=(10, 0))
+
+    def open_log(self):
+        if self.log_path and Path(self.log_path).exists():
+            os.startfile(self.log_path)
+        else:
+            self.set_status("Keine Log-Datei vorhanden.", WARN)
+
+    def _build_sql_card(self, side):
+        card = Card(side, "Datenbank (SQL Server)", "database")
+        card.pack(fill="x", pady=(0, 12))
+        b = card.body
+        c = self.cfg.setdefault("sql", dict(DEFAULT_CONFIG["sql"]))
+        self.sql_vars = {}
+        for key, label in (("server", "Server (ggf. mit Instanz, z. B. SERVER\\SQLEXPRESS)"),
+                           ("database", "Datenbank"), ("user", "SQL-Benutzer")):
+            field_label(b, label)
+            v = tk.StringVar(value=c.get(key, ""))
+            e = entry(b, v)
+            e.pack(fill="x")
+            e.bind("<FocusOut>", lambda ev: self._save_sql_fields(), add="+")
+            self.sql_vars[key] = v
+        self.sql_info = ctk.CTkLabel(b, text="", compound="left", text_color=MUTED, font=F(12), anchor="w",
+                                     justify="left", wraplength=340)
+        self.sql_info.pack(fill="x", pady=(8, 0))
+        button(b, " Verbindung einrichten & testen", self.setup_sql, icon="database").pack(fill="x", pady=(8, 0))
+        self._update_sql_info()
+
+    def _save_sql_fields(self):
+        self.cfg["sql"] = {k: v.get().strip() for k, v in self.sql_vars.items()}
+        save_config(self.cfg)
+        self._update_sql_info()
+
+    def _update_sql_info(self, text=None, color=None):
+        if text is None:
+            c = self._sql_cfg()
+            if not self._sql_ready():
+                text, color = "Noch nicht eingerichtet – Server, Datenbank und Benutzer eintragen.", WARN
+            elif not sqldb.has_password(c["server"]):
+                text, color = "Passwort fehlt – „Verbindung einrichten & testen“ klicken.", WARN
+            else:
+                text, color = "Eingerichtet – FA-Nr. eingeben und Enter drücken.", MUTED
+        self.sql_info.configure(text=text, text_color=color)
+
+    def setup_sql(self):
+        self._save_sql_fields()
+        if not self._sql_ready():
+            self._update_sql_info("Bitte zuerst Server, Datenbank und Benutzer eintragen.", ERR)
+            return
+        c = self._sql_cfg()
+        vals = ask_form(self.root, "SQL-Verbindung einrichten",
+                        [(f"Passwort für „{c['user']}“", "", True)], ok_text="Testen & speichern",
+                        message=f"Server {c['server']} · Datenbank {c['database']}. Das Passwort wird nur in der "
+                                "Windows-Anmeldeinformationsverwaltung gespeichert, nicht im Programm.")
+        if not vals or not vals[0]:
+            return
+        pw = vals[0]
+        self._update_sql_info("Teste Verbindung…", MUTED)
+
+        def work():
+            try:
+                n = sqldb.test_connection(c["server"], c["database"], c["user"], pw)
+                sqldb.store_password(c["server"], c["user"], pw)
+                res = (f"✓ Verbunden – {n} Einträge in SMD_FA_Fehler. Passwort in Windows gespeichert.", OK_GREEN)
+            except Exception as e:
+                res = (f"Verbindung fehlgeschlagen: {e}", ERR)
+            self.root.after(0, lambda: self._update_sql_info(*res))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    # ================= Offline-Puffer =================
+    def _update_buffer_badge(self, n):
+        if n:
+            self.buffer_label.configure(text=f"  {n} im Puffer – wird nachgetragen")
+            self.buffer_label.pack(side="right", padx=(0, 4), before=self.count_label)
+        else:
+            self.buffer_label.pack_forget()
+
+    def _retry_timer(self):
+        if self.store.pending_count():
+            self.retry_buffer()
+        self.root.after(RETRY_MS, self._retry_timer)
+
+    def retry_buffer(self, manual=False):
+        if self._retrying or not self.store.pending_count():
+            return
+        self._retrying = True
+
+        def work():
+            try:
+                done, left, err = self.store.retry()
+            except Exception as e:
+                done, left, err = 0, self.store.pending_count(), str(e)
+            self.root.after(0, lambda: self._retry_done(done, left, err, manual))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _retry_done(self, done, left, err, manual):
+        self._retrying = False
+        self._update_buffer_badge(left)
+        if done:
+            self.set_status(f"{done} Aufnahme(n) aus dem Puffer nachgetragen"
+                            f"{f' – {left} noch offen' if left else ''}.", OK_GREEN if not left else WARN)
+            self.toast(f"{done} aus dem Puffer nachgetragen", OK_GREEN)
+            self.load_recent()
+        elif manual and err:
+            self.set_status(f"Puffer: Nachtragen noch nicht möglich – {err}", WARN)
 
     def _update_theme_button(self):
         dark = ctk.get_appearance_mode() == "Dark"
@@ -658,13 +904,313 @@ class App:
         self.case_id = new_case_id()
         self.case_img = 0
         self.artikel_var.set("")
-        self.serie_var.set("")
+        self.artikeltext_var.set("")
+        self.fa_var.set("")
         self.desc_text.delete("1.0", "end")
         self.fehler_menu.set(NO_FEHLERART)
-        for var, widget, lbl, _ in self._required:
+        for var, widget, lbl, _, _ in self._required:
             set_error(widget, lbl, None)
+        self.fa_info.pack_forget()
+        self._bauteile = []
+        self._bauteil_details = {}
+        self.bauteil_var.set("")
+        self.bauteil_combo.configure(values=[""])
+        self.bauteil_info.configure(text="Wird nach dem Laden des Fertigungsauftrags bzw. der Platinen-Nr. gefüllt.",
+                                    text_color=MUTED)
         self._update_case_label()
-        self.set_status(f"Neuer Fall {self.case_id} angelegt – Hersteller und Bearbeiter wurden übernommen.")
+        self.fa_entry.focus_set()   # direkt nächste FA-Nr. scannen
+
+    # ================= SQL Server: Fertigungsauftrag nachschlagen =================
+    # ---- Vorschläge beim Tippen ----
+    def _fa_typed(self, event):
+        if event.keysym in ("Return", "KP_Enter", "Up", "Down", "Escape", "Tab", "Left", "Right",
+                            "Shift_L", "Shift_R", "Control_L", "Control_R"):
+            return
+        if self._suggest_job:
+            self.root.after_cancel(self._suggest_job)
+        self._suggest_job = self.root.after(200, self._run_suggest)
+
+    def _run_suggest(self):
+        self._suggest_job = None
+        text = self.fa_var.get().strip()
+        if not text or not self._sql_ready():
+            self.fa_suggest.hide()
+            return
+        self._suggest_seq += 1
+        seq, cfg = self._suggest_seq, dict(self._sql_cfg())
+
+        def work():
+            try:
+                rows = sqldb.suggest_auftraege(cfg, text)
+            except Exception:
+                rows = None     # Fehler zeigt spätestens die normale Suche (Enter) an
+            self.root.after(0, lambda: self._show_suggest(seq, text, rows))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _show_suggest(self, seq, text, rows):
+        # veraltete Antworten (inzwischen weitergetippt) oder Feld nicht mehr aktiv -> ignorieren
+        if seq != self._suggest_seq or text != self.fa_var.get().strip() or rows is None:
+            return
+        if self.root.focus_get() is not self.fa_entry._entry:
+            return
+        if len(rows) == 1 and rows[0][0] == text and self.artikel_var.get().strip() == rows[0][1]:
+            self.fa_suggest.hide()   # bereits übernommen
+            return
+        w = max((len(a) for _, a, _ in rows), default=0) + 2
+        items = [(f"{bel:<7}{art:<{w}}{txt}", (bel, art, txt)) for bel, art, txt in rows]
+        self.fa_suggest.show(items, header="Vorschläge aus der Datenbank  ·  ↑↓ + Enter oder klicken"
+                             if items else None)
+
+    def _fa_nav(self, step):
+        if self.fa_suggest.visible:
+            self.fa_suggest.move(step)
+            return "break"
+
+    def _fa_return(self, event=None):
+        if self.fa_suggest.visible and self.fa_suggest.sel >= 0:
+            self.fa_suggest.pick()
+        else:
+            self.fa_suggest.hide()
+            self.lookup_auftrag()
+        return "break"
+
+    def _fa_focus_lost(self):
+        try:
+            focus = self.root.focus_get()
+        except Exception:
+            focus = None
+        win = self.fa_suggest.win
+        if win is not None and self.fa_suggest.visible:   # Maus über der Liste -> Klick abwarten
+            px, py = self.root.winfo_pointerxy()
+            if (win.winfo_rootx() <= px <= win.winfo_rootx() + win.winfo_width()
+                    and win.winfo_rooty() <= py <= win.winfo_rooty() + win.winfo_height()):
+                self.root.after(300, self._fa_focus_lost)
+                return
+        if focus is not self.fa_entry._entry:
+            self.fa_suggest.hide()
+
+    def _pick_suggestion(self, payload):
+        bel, art, txt = payload
+        if self._suggest_job:
+            self.root.after_cancel(self._suggest_job)
+            self._suggest_job = None
+        self._suggest_seq += 1
+        self.fa_var.set(bel)
+        self._auftrag_result(bel, [payload], None)
+        self.fa_entry.focus_set()
+        self.fa_entry._entry.icursor("end")
+
+    def _fa_error(self, message):
+        set_error(self.fa_entry, self.fa_err, message, after=self.fa_entry.master)
+
+    def _sql_cfg(self):
+        return self.cfg.get("sql", {})
+
+    def _sql_ready(self):
+        c = self._sql_cfg()
+        return bool(c.get("server") and c.get("database") and c.get("user"))
+
+    def lookup_auftrag(self):
+        fa = self.fa_var.get().strip()
+        self._fa_error(None)
+        self.fa_info.pack_forget()
+        if not fa:
+            self._fa_error("Bitte FA-Nr. eingeben oder scannen")
+            return
+        if not self._sql_ready():
+            self._fa_error("Datenbank nicht eingerichtet – unten unter „Datenbank“")
+            return
+        self.fa_info.configure(text="Suche in der Datenbank…", text_color=MUTED)
+        self.fa_info.pack(fill="x", pady=(4, 0), after=self.fa_entry.master)
+        cfg = dict(self._sql_cfg())
+
+        def work():
+            try:
+                rows, err = sqldb.lookup_auftrag(cfg, fa), None
+            except Exception as e:
+                rows, err = [], str(e)
+            self.root.after(0, lambda: self._auftrag_result(fa, rows, err))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _auftrag_result(self, fa, rows, err):
+        self.fa_info.pack_forget()
+        if err:
+            self._fa_error("Datenbankfehler – Details in der Statuszeile")
+            log.error("SQL: Fertigungsauftrag %s nicht abfragbar: %s", fa, err)
+            self.set_status(f"SQL-Fehler: {err}", ERR)
+            return
+        if not rows:
+            self._fa_error(f"FA-Nr. {fa} nicht gefunden")
+            return
+        if len(rows) > 1:   # mehrere Leiterplatten im Auftrag -> auswählen lassen
+            labels = [f"{a}  –  {t}" for _, a, t in rows]
+            choice = self._choose(f"FA {fa}: Leiterplatte wählen", labels)
+            if choice is None:
+                return
+            rows = [rows[labels.index(choice)]]
+        _, art, text = rows[0]
+        self.artikel_var.set(art)
+        self.artikeltext_var.set(text)
+        self.fa_info.configure(text=f"✓ Aus Datenbank: {art} · {text}", text_color=OK_GREEN)
+        self.fa_info.pack(fill="x", pady=(4, 0), after=self.fa_entry.master)
+        self.toast(f"FA {fa}: {text}", OK_GREEN, ms=2500)
+        self.load_bauteile()
+
+    # ---- Stückliste -> Bauteil-Auswahl ----
+    MAX_BAUTEIL_ITEMS = 300
+
+    def load_bauteile(self):
+        art = self.artikel_var.get().strip()
+        if not (art and self._sql_ready()):
+            return
+        self.bauteil_info.configure(text="Lade Stückliste…", text_color=MUTED)
+        cfg = dict(self._sql_cfg())
+
+        def work():
+            try:
+                items, cols = sqldb.lookup_bauteile(cfg, art)
+                err = None
+            except Exception as e:
+                items, cols, err = [], None, str(e)
+            self.root.after(0, lambda: self._bauteile_result(art, items, cols, err))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _bauteile_result(self, art, items, cols, err):
+        if art != self.artikel_var.get().strip():
+            return   # inzwischen andere Leiterplatte gewählt
+        if err:
+            log.error("Stückliste zu %s: %s", art, err)
+            self.bauteil_info.configure(text=f"Stückliste konnte nicht geladen werden: {err}", text_color=ERR)
+            return
+        self._bauteil_details = dict(items)
+        self._bauteile = [lbl for lbl, _ in items]
+        self.bauteil_var.set("")
+        self.bauteil_combo.configure(values=self._bauteile[:self.MAX_BAUTEIL_ITEMS] or [""])
+        if items:
+            used = ", ".join(cols[k] for k in ("pos", "artnr", "bez", "package", "technology", "type")
+                             if cols.get(k))
+            self.bauteil_info.configure(text=f"{len(items)} Bauteile aus der Stückliste ({used}).",
+                                        text_color=MUTED)
+        else:
+            self.bauteil_info.configure(text=f"Keine Stückliste zu {art} gefunden.", text_color=WARN)
+
+    def bauteil_details(self):
+        """Details des gewählten Bauteils (leer, wenn frei eingetippt)."""
+        return self._bauteil_details.get(self.bauteil_var.get().strip(), {})
+
+    def _show_bauteil_detail(self):
+        d = self.bauteil_details()
+        parts = [f"{k}: {d[v]}" for k, v in (("Position", "pos"), ("Gehäuse", "package"),
+                                                 ("Technologie", "technology"), ("Typ", "type")) if d.get(v)]
+        if parts:
+            self.bauteil_detail.configure(text="   ·   ".join(parts))
+            self.bauteil_detail.pack(fill="x", pady=(6, 0), after=self.bauteil_info)
+        else:
+            self.bauteil_detail.pack_forget()
+
+    def _match_bauteile(self, text):
+        """Treffer in Artikel-Nr., Bezeichnung und Position; 'beginnt mit' vor 'enthält'."""
+        norm = lambda s: s.lower().replace(" ", "")      # "0122" findet auch "012 100 22"
+        text = norm(text)
+        if not text:
+            return list(self._bauteile)
+        starts, contains = [], []
+        for lbl in self._bauteile:
+            d = self._bauteil_details.get(lbl, {})
+            fields = [d.get("artnr", ""), d.get("bez", "")] + [p.strip() for p in d.get("pos", "").split(",")]
+            fields = [norm(f) for f in fields if f]
+            if any(f.startswith(text) for f in fields):
+                starts.append(lbl)
+            elif text in norm(lbl) or any(text in f for f in fields):
+                contains.append(lbl)
+        return starts + contains
+
+    def _filter_bauteile(self, event):
+        if event.keysym in ("Return", "KP_Enter", "Up", "Down", "Left", "Right", "Tab", "Escape",
+                            "Shift_L", "Shift_R", "Control_L", "Control_R"):
+            return
+        text = self.bauteil_var.get()
+        hits = self._match_bauteile(text)
+        self.bauteil_combo.configure(values=hits[:self.MAX_BAUTEIL_ITEMS] or [""])
+        if not self._bauteile:
+            return
+        self.bauteil_info.configure(text=f"{len(hits)} von {len(self._bauteile)} Bauteilen passen.",
+                                    text_color=MUTED if hits else WARN)
+        if not text.strip() or text.strip() in self._bauteil_details:
+            self.bauteil_suggest.hide()
+            return
+        items = []
+        for lbl in hits[:10]:
+            pos = self._bauteil_details.get(lbl, {}).get("pos", "")
+            if len(pos) > 18:
+                pos = pos[:17] + "…"
+            items.append((f"{lbl}" + (f"   [{pos}]" if pos else ""), lbl))
+        header = f"Bauteile aus der Stückliste  ·  {len(hits)} Treffer  ·  ↑↓ + Enter oder klicken"
+        self.bauteil_suggest.show(items, header=header if items else None)
+
+    def _pick_bauteil(self, label):
+        self.bauteil_var.set(label)
+        self.bauteil_combo.configure(values=self._bauteile[:self.MAX_BAUTEIL_ITEMS] or [""])
+        self.bauteil_info.configure(text=f"{len(self._bauteile)} Bauteile aus der Stückliste.", text_color=MUTED)
+        self.bauteil_combo.focus_set()
+
+    def _bauteil_nav(self, step):
+        if self.bauteil_suggest.visible:
+            self.bauteil_suggest.move(step)
+            return "break"
+
+    def _bauteil_return(self, event=None):
+        if self.bauteil_suggest.visible and self.bauteil_suggest.sel >= 0:
+            self.bauteil_suggest.pick()
+        elif self.bauteil_suggest.visible and len(self.bauteil_suggest.items) == 1:
+            self.bauteil_suggest.pick(0)             # eindeutiger Treffer -> direkt übernehmen
+        else:
+            self.bauteil_suggest.hide()
+            self._open_bauteil_list()
+        return "break"
+
+    def _bauteil_focus_lost(self):
+        win = self.bauteil_suggest.win
+        if win is not None and self.bauteil_suggest.visible:      # Maus über der Liste -> Klick abwarten
+            px, py = self.root.winfo_pointerxy()
+            if (win.winfo_rootx() <= px <= win.winfo_rootx() + win.winfo_width()
+                    and win.winfo_rooty() <= py <= win.winfo_rooty() + win.winfo_height()):
+                self.root.after(300, self._bauteil_focus_lost)
+                return
+        try:
+            focus = self.root.focus_get()
+        except Exception:
+            focus = None
+        if focus is not self.bauteil_combo._entry:
+            self.bauteil_suggest.hide()
+
+    def _open_bauteil_list(self):
+        try:
+            self.bauteil_combo._open_dropdown_menu()
+        except Exception:
+            pass
+
+    def _choose(self, title, options):
+        dlg = ctk.CTkToplevel(self.root)
+        dlg.title(title)
+        dlg.configure(fg_color=CARD)
+        dlg.transient(self.root)
+        res = {"v": None}
+        body = ctk.CTkFrame(dlg, fg_color="transparent")
+        body.pack(padx=24, pady=20)
+        ctk.CTkLabel(body, text=title, text_color=FG, font=F(16, "bold")).pack(anchor="w", pady=(0, 10))
+        for opt in options:
+            button(body, opt, lambda o=opt: (res.update(v=o), dlg.destroy()), width=420,
+                   anchor="w").pack(fill="x", pady=3)
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        dlg.after(80, lambda: (dlg.lift(), dlg.focus_force()))
+        dlg.grab_set()
+        self.root.wait_window(dlg)
+        return res["v"]
+        self.set_status(f"Neuer Fall {self.case_id} angelegt – nächsten Fertigungsauftrag scannen.")
         self.toast(f"Neuer Fall {self.case_id}", OK_GREEN)
 
     def cycle_fehlerart(self, step):
@@ -681,15 +1227,15 @@ class App:
 
     def _check_required(self):
         """False, wenn Pflichtfelder fehlen (erneutes Auslösen innerhalb kurzer Zeit speichert trotzdem)."""
-        missing = [(w, l, name) for v, w, l, name in self._required if not v.get().strip()]
+        missing = [(w, l, name, a) for v, w, l, name, a in self._required if not v.get().strip()]
         if not missing:
             return True
         if time.time() < self._override_until:
             self._override_until = 0
             return True
-        for w, l, name in missing:
-            set_error(w, l, f"{name} ist ein Pflichtfeld")
-        names = " und ".join(n for _, _, n in missing)
+        for w, l, name, a in missing:
+            set_error(w, l, "Pflichtfeld", after=a)
+        names = " und ".join(n for _, _, n, _ in missing)
         verb = "fehlen" if len(missing) > 1 else "fehlt"
         self._override_until = time.time() + OVERRIDE_S
         self.set_status(f"{names} {verb} – bitte ausfüllen. Erneut F9 innerhalb von "
@@ -747,6 +1293,7 @@ class App:
         cam = CameraThread(idx, w, h, backend, fourcc)
         cam.mode_name = mode
         if not cam.running:
+            log.warning("Kamera %s (%s) konnte mit %s nicht geöffnet werden", idx, self.selected_name(), mode)
             self.set_status(f"Kamera {idx} konnte mit {mode} nicht geöffnet werden.", ERR)
             return False
         cam.start()
@@ -760,6 +1307,7 @@ class App:
         self.stop_camera()
         if not queue:
             self._open_mode(next(iter(MODES)))
+            log.warning("Kamera %s: kein Bildsignal in allen Videomodi", self.selected_name())
             self.set_status("Kein Bildsignal in allen Videomodi – HDMI-Quelle, Kabel und "
                             "Auflösung des Mikroskops prüfen (siehe Diagnose).", WARN)
             return
@@ -772,6 +1320,7 @@ class App:
             if gen != self._gen or not self.cam:
                 return
             if self.cam.got_signal:
+                log.info("Kamera läuft: %s, %s, %sx%s", self.selected_name(), mode, *self.cam.actual_size)
                 self.set_status(f"Kamera läuft (Auto → {mode}) – bereit für Aufnahmen.", OK_GREEN)
             else:
                 self._auto_try(rest, gen)
@@ -790,6 +1339,7 @@ class App:
         self._reconnect_name = self.selected_name()
         self._gen += 1
         self.stop_camera(wait=False)   # read() kann bei abgezogenem USB hängen -> nicht warten
+        log.warning("Kamera %s: Verbindung unterbrochen, starte Neuverbindung", self._reconnect_name)
         self.set_status("Verbindung zur Kamera unterbrochen – verbinde automatisch neu…", WARN)
         self.toast("Kamera getrennt – verbinde neu…", WARN, ok=False, ms=4000)
         gen = self._gen
@@ -811,6 +1361,7 @@ class App:
                         return
                     if self.cam and self.cam.got_signal:
                         self._reconnecting = False
+                        log.info("Kamera %s wieder verbunden (Versuch %s)", self._reconnect_name, attempt)
                         self.set_status("Kamera wieder verbunden – bereit für Aufnahmen.", OK_GREEN)
                         self.toast("Kamera wieder verbunden", OK_GREEN)
                     else:
@@ -1038,6 +1589,7 @@ class App:
             ox, oy = (cw - dw) // 2, (ch - dh) // 2
             self._view = (x0, y0, s, ox, oy, fw, fh)
             small = cv2.resize(crop, (dw, dh), interpolation=cv2.INTER_AREA if s < 1 else cv2.INTER_LINEAR)
+            small = overlay.apply_adjust(small, self.cfg.get("image_adjust"))
             if time.time() < self._flash_until:   # Blitz-Effekt nach Aufnahme
                 small = cv2.addWeighted(small, 0.35, np.full_like(small, 255), 0.65, 0)
             self._photo = ImageTk.PhotoImage(Image.fromarray(cv2.cvtColor(small, cv2.COLOR_BGR2RGB)))
@@ -1184,12 +1736,18 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def _server_result(self, d, err):
+        if (err is None) != self._server_ok:     # nur Änderungen protokollieren
+            if err is None:
+                log.info("Speicherort beschreibbar: %s", d)
+            else:
+                log.error("Speicherort NICHT beschreibbar: %s – %s", d, err)
         self._server_ok = err is None
         if err is None:
             self.server_info.configure(text="  Schreibzugriff OK", image=ctk_icon("check", 14, OK_GREEN),
                                        text_color=OK_GREEN)
             self.banner.grid_remove()
             self.load_recent()
+            self.retry_buffer()           # Server wieder da -> Puffer nachtragen
         else:
             self.server_info.configure(text="  Kein Schreibzugriff – Details oben", image=ctk_icon("warning", 14, ERR),
                                        text_color=ERR)
@@ -1202,7 +1760,8 @@ class App:
             else:
                 hint = "Netzwerk, Laufwerk N: und Schreibrechte des Windows-Benutzers prüfen."
             self.banner_text.configure(
-                text=f"Speicherort nicht beschreibbar – Bilder können so nicht gespeichert werden.\n"
+                text=f"Speicherort nicht beschreibbar – Aufnahmen werden lokal zwischengespeichert und "
+                     f"automatisch nachgetragen, sobald der Server erreichbar ist.\n"
                      f"{hint}\n\n{d}\nTechnischer Grund: {err.split(':')[0]}")
             if not self._fullscreen:
                 self.banner.grid(row=0, column=0, sticky="ew", pady=(0, 10))
@@ -1279,9 +1838,14 @@ class App:
         d = Path(self.dir_var.get().strip())
 
         def work():
+            mtime = lambda p: p.stat().st_mtime
             try:
-                files = sorted((p for p in d.iterdir() if p.suffix.lower() in IMAGE_EXTS),
-                               key=lambda p: p.stat().st_mtime, reverse=True)[:STRIP_COUNT]
+                # Hauptordner + die zuletzt geänderten Auftrags-Unterordner durchsuchen
+                subs = sorted((p for p in d.iterdir() if p.is_dir() and not p.name.startswith(".")),
+                              key=mtime, reverse=True)[:12]
+                files = [p for folder in [d] + subs for p in folder.iterdir()
+                         if p.suffix.lower() in IMAGE_EXTS]
+                files = sorted(files, key=mtime, reverse=True)[:STRIP_COUNT]
             except Exception:
                 files = []
             items = []
@@ -1313,7 +1877,13 @@ class App:
             ctk.CTkButton(self.strip, image=ci, text="", width=img.size[0] + 10, height=img.size[1] + 10,
                           fg_color=FIELD, hover_color=ACCENT, border_width=1, border_color=BORDER,
                           corner_radius=8, border_spacing=4, cursor="hand2",
-                          command=lambda p=path: os.startfile(p)).pack(side="left", padx=(0, 8))
+                          command=lambda p=path: self._open_image(p)).pack(side="left", padx=(0, 8))
+
+    def _open_image(self, path):
+        try:
+            os.startfile(path)
+        except OSError:
+            self.set_status(f"{Path(path).name} ist noch nicht auf dem Server (Puffer) – wird nachgetragen.", WARN)
 
     def add_to_strip(self, path, img_bgr):
         h, w = img_bgr.shape[:2]
@@ -1351,11 +1921,6 @@ class App:
             overlay_info=self.info_var.get(),
             overlay_scale=self.scale_var.get(),
         )
-        h = self.hersteller_var.get().strip()
-        if h:
-            hist = [h] + [x for x in self.cfg["hersteller_history"] if x != h]
-            self.cfg["hersteller_history"] = hist[:30]
-            self.hersteller_combo.configure(values=self.cfg["hersteller_history"])
         save_config(self.cfg)
 
     def capture(self):
@@ -1374,11 +1939,13 @@ class App:
     def _info_items(self, now, img_no):
         cal = self.cfg.get("calibration") if self.active_ppm(1) else ""
         return [now.strftime("%d.%m.%Y  %H:%M"),
+                f"FA {self.fa_var.get().strip()}" if self.fa_var.get().strip() else "",
                 f"Fall {self.case_id} / Bild {img_no}",
-                self.hersteller_var.get().strip(),
-                f"Art.-Nr. {self.artikel_var.get().strip()}" if self.artikel_var.get().strip() else "",
-                f"S/N {self.serie_var.get().strip()}" if self.serie_var.get().strip() else "",
+                f"Platinen-Nr. {self.artikel_var.get().strip()}" if self.artikel_var.get().strip() else "",
+                self.artikeltext_var.get().strip(),
                 self.fehlerart(),
+                ("Bauteil " + self.bauteil_var.get().strip().replace("  ·  ", ", "))
+                if self.bauteil_var.get().strip() else "",
                 cal,
                 self.bearbeiter_var.get().strip()]
 
@@ -1394,16 +1961,18 @@ class App:
             return
         self._override_until = 0
         self._flash_until = time.time() + 0.15
+        frame = overlay.apply_adjust(frame, self.cfg.get("image_adjust"))   # Helligkeit/Kontrast/WB
 
         now = datetime.now()
         img_no = self.case_img + 1
         ppm = self.active_ppm(frame.shape[1])
+        fa = self.fa_var.get().strip()
 
         # Markieren direkt nach der Aufnahme
         shapes = []
         if self.annotate_var.get():
-            sub = f"Fall {self.case_id} · Bild {img_no} · {self.hersteller_var.get().strip()} " \
-                  f"{self.artikel_var.get().strip()}".strip()
+            sub = f"FA {fa} · Fall {self.case_id} · Bild {img_no} · " \
+                  f"{self.artikel_var.get().strip()} {self.artikeltext_var.get().strip()}".strip()
             dlg = AnnotateDialog(self.root, frame, ppm, subtitle=sub)
             self.root.wait_window(dlg)
             action, shapes = dlg.result
@@ -1418,64 +1987,70 @@ class App:
         if self.info_var.get():
             img = overlay.add_info_bar(img, self._info_items(now, img_no))
 
-        save_dir = Path(self.dir_var.get().strip())
-        try:
-            save_dir.mkdir(parents=True, exist_ok=True)
-        except Exception as e:
-            messagebox.showerror(APP_NAME, f"Zielordner nicht erreichbar:\n{save_dir}\n\n{e}")
-            return
-
-        parts = [now.strftime("%Y-%m-%d_%H-%M-%S")]
-        for v in (self.hersteller_var.get(), self.artikel_var.get(), self.serie_var.get()):
-            if v.strip():
-                parts.append(safe_name(v))
         ext = self.fmt_seg.get().lower()
-        path = save_dir / ("_".join(parts) + f".{ext}")
-        n = 2
-        while path.exists():
-            path = save_dir / ("_".join(parts) + f"_{n}.{ext}")
-            n += 1
-
         params = [cv2.IMWRITE_JPEG_QUALITY, 95] if ext == "jpg" else [cv2.IMWRITE_PNG_COMPRESSION, 3]
         ok, buf = cv2.imencode(f".{ext}", img, params)
-        try:
-            if not ok:
-                raise RuntimeError("Bild konnte nicht kodiert werden")
-            path.write_bytes(buf.tobytes())  # funktioniert auch mit Umlauten / UNC-Pfaden
-        except Exception as e:
-            messagebox.showerror(APP_NAME, f"Bild konnte nicht gespeichert werden:\n{e}")
+        if not ok:
+            log.error("Bild konnte nicht kodiert werden")
+            messagebox.showerror(APP_NAME, "Bild konnte nicht kodiert werden.")
             return
+        thumb = None
+        if self.excel_var.get() and self.thumb_var.get():
+            h, w = img.shape[:2]
+            th = storage.THUMB_HEIGHT
+            thumb = cv2.imencode(".jpg", cv2.resize(img, (int(w * th / h), th), interpolation=cv2.INTER_AREA),
+                                 [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tobytes()
+
+        parts = [now.strftime("%Y-%m-%d_%H-%M-%S")]
+        for v in (f"FA{fa}" if fa else "", self.artikel_var.get()):
+            if v.strip():
+                parts.append(safe_name(v))
+        filename = "_".join(parts) + f".{ext}"
+        det = self.bauteil_details()
+        cal = self.cfg.get("calibration") if self.active_ppm(1) else ""
+        values = {
+            "Datum": now.strftime("%d.%m.%Y"), "Uhrzeit": now.strftime("%H:%M:%S"),
+            "Fertigungsauftrag (Bel_Nr)": fa,
+            "Fall-Nr.": self.case_id, "Bild-Nr.": img_no,
+            "Platinen-Nr.": self.artikel_var.get().strip(),
+            "Artikelbezeichnung": self.artikeltext_var.get().strip(),
+            "Fehlerart": self.fehlerart(),
+            "Bauteil": self.bauteil_var.get().strip(),
+            "Position": det.get("pos", ""),
+            "Gehäuse": det.get("package", ""), "Technologie": det.get("technology", ""),
+            "Bauteiltyp": det.get("type", ""),
+            "Schadensbeschreibung": self.desc_text.get("1.0", "end").strip(),
+            "Vergrößerung": cal,
+            "Bearbeiter": self.bearbeiter_var.get().strip(),
+            "Dateiname": filename,
+        }
+        excel_name = (self.excel_name_var.get().strip() or DEFAULT_CONFIG["excel_name"]) \
+            if self.excel_var.get() else None
+        rec = storage.Store.new_record(self.dir_var.get().strip(), fa, filename, excel_name, values)
+        state, reason = self.store.save(rec, buf.tobytes(), thumb)
 
         self.case_img = img_no
         self._update_case_label()
         self.persist()
         self.session_count += 1
         self._update_count()
-        undo = {"path": path, "case_id": self.case_id, "xlsx": None}
-        msg, color, toast, ok = f"Gespeichert: {path.name}", OK_GREEN, f"Bild {img_no} gespeichert", True
-        if shapes:
-            toast += f"  ·  {len(shapes)} Markierung{'en' if len(shapes) != 1 else ''}"
-
-        if self.excel_var.get():
-            try:
-                undo["xlsx"] = self.append_excel(save_dir, path, now, img, img_no)
-                msg += "   ·   Excel aktualisiert"
-                toast += "  ·  Excel aktualisiert"
-            except PermissionError:
-                msg += "   ·   Excel GESPERRT"
-                toast, color, ok = "Bild gespeichert – Excel gesperrt", WARN, False
-                messagebox.showwarning(
-                    APP_NAME,
-                    "Das Bild wurde gespeichert, aber die Excel-Liste ist gerade geöffnet "
-                    "(evtl. von einem Kollegen) und konnte nicht beschrieben werden.\n\n"
-                    "Bitte Excel schließen und die Aufnahme ggf. nachtragen.")
-            except Exception as e:
-                msg += "   ·   Excel-Fehler"
-                toast, color, ok = "Bild gespeichert – Excel-Fehler", WARN, False
-                messagebox.showwarning(APP_NAME, f"Excel-Eintrag fehlgeschlagen:\n{e}")
-        self.undo_stack.append(undo)
-        self.set_status(msg + "   ·   F8 = rückgängig", color)
-        self.toast(toast, color, ok=ok)
+        self.undo_stack.append({"rec": rec, "case_id": self.case_id})
+        path = self.store.image_path(rec)
+        marks = f"  ·  {len(shapes)} Markierung{'en' if len(shapes) != 1 else ''}" if shapes else ""
+        if state == "ok":
+            msg = f"Gespeichert: {rec['fa_folder']}\\{rec['filename']}" + ("   ·   Excel aktualisiert" if excel_name else "")
+            self.set_status(msg + "   ·   F8 = rückgängig", OK_GREEN)
+            self.toast(f"Bild {img_no} gespeichert{marks}" + ("  ·  Excel aktualisiert" if excel_name else ""))
+        elif state == "excel_buffered":
+            self.set_status(f"Bild gespeichert, Excel-Eintrag im Puffer ({reason}) – wird automatisch nachgetragen.",
+                            WARN)
+            self.toast(f"Bild {img_no} gespeichert  ·  Excel wird nachgetragen", WARN, ok=False)
+        else:
+            self.set_status(f"Server nicht erreichbar – Bild lokal zwischengespeichert, wird automatisch "
+                            f"nachgetragen. ({reason})", WARN)
+            self.toast(f"Bild {img_no} im Puffer  ·  wird nachgetragen", WARN, ok=False)
+            if self._server_ok:
+                self.check_server()
         self.add_to_strip(path, img)
 
     def _update_count(self):
@@ -1491,26 +2066,9 @@ class App:
             self.toast("Nichts rückgängig zu machen", WARN, ok=False, ms=2000)
             return
         item = self.undo_stack.pop()
-        path = item["path"]
-        warn = None
-        try:
-            if path.exists():   # nicht endgültig löschen, sondern in versteckten Papierkorb-Ordner
-                trash = path.parent / ".papierkorb"
-                if not trash.exists():
-                    trash.mkdir()
-                    hide_dir(trash)
-                os.replace(path, trash / path.name)
-            (path.parent / ".thumbs" / (path.stem + ".jpg")).unlink(missing_ok=True)
-        except Exception as e:
-            warn = f"Bild konnte nicht entfernt werden: {e}"
-        if item["xlsx"]:
-            try:
-                self.remove_excel_row(item["xlsx"], path.name)
-            except PermissionError:
-                warn = "Excel-Liste ist geöffnet – Zeile bitte von Hand löschen."
-            except Exception as e:
-                warn = f"Excel-Zeile konnte nicht entfernt werden: {e}"
-
+        rec = item["rec"]
+        path = self.store.image_path(rec)
+        warn = self.store.undo(rec)
         if item["case_id"] == self.case_id and self.case_img > 0:
             self.case_img -= 1
             self._update_case_label()
@@ -1521,95 +2079,57 @@ class App:
             self.set_status(f"Rückgängig: {path.name} – {warn}", WARN)
             self.toast("Rückgängig – mit Warnung", WARN, ok=False)
         else:
-            self.set_status(f"Rückgängig: {path.name} in den Ordner „.papierkorb“ verschoben"
-                            f"{' und aus Excel entfernt' if item['xlsx'] else ''}.", OK_GREEN)
+            self.set_status(f"Rückgängig: {path.name} entfernt (Bild liegt im Ordner „.papierkorb“).", OK_GREEN)
             self.toast("Letzte Aufnahme rückgängig gemacht", OK_GREEN)
 
-    # ================= Excel =================
-    def _open_sheet(self, xlsx):
-        """Öffnet/erstellt die Liste; liefert (wb, ws, {Überschrift: Spalte})."""
-        if xlsx.exists():
-            wb = load_workbook(xlsx)
-            ws = wb.active
-        else:
-            wb = Workbook()
-            ws = wb.active
-            ws.title = "Schäden"
-            ws.freeze_panes = "A2"
-        cols = {c.value: c.column for c in ws[1] if c.value}
-        for name, width in EXCEL_COLUMNS:
-            if name not in cols:
-                col = max(cols.values(), default=0) + 1
-                cell = ws.cell(row=1, column=col, value=name)
-                cell.font = Font(bold=True, color="FFFFFF")
-                cell.fill = PatternFill("solid", fgColor="305496")
-                ws.column_dimensions[get_column_letter(col)].width = width
-                cols[name] = col
-        return wb, ws, cols
-
-    def _place_thumbs(self, ws, cols, thumb_dir):
-        # openpyxl verliert beim Laden vorhandene Bilder -> alle Vorschaubilder neu einfügen
-        ws._images = []
-        if not thumb_dir.is_dir():
+    # ================= PDF-Bericht =================
+    def make_pdf_report(self):
+        fa = self.fa_var.get().strip()
+        if not fa:
+            self._fa_error("Für den Bericht bitte den Fertigungsauftrag eingeben")
             return
-        name_col, thumb_col = cols["Dateiname"], get_column_letter(cols["Vorschau"])
-        for row in range(2, ws.max_row + 2):
-            name = ws.cell(row=row, column=name_col).value
-            t = thumb_dir / (Path(str(name)).stem + ".jpg") if name else None
-            if t and t.exists():
-                ws.add_image(XLImage(str(t)), f"{thumb_col}{row}")
-                ws.row_dimensions[row].height = THUMB_HEIGHT * 0.78
-            elif row in ws.row_dimensions:
-                ws.row_dimensions[row].height = None
+        root_dir = Path(self.dir_var.get().strip())
+        excel_name = self.excel_name_var.get().strip() or DEFAULT_CONFIG["excel_name"]
+        author = self.bearbeiter_var.get().strip()
+        self.set_status(f"Erstelle PDF-Bericht für FA {fa}…")
+        pending = self.store.pending_count()
 
-    def append_excel(self, save_dir, img_path, now, img, img_no):
-        if Workbook is None:
-            raise RuntimeError("openpyxl ist nicht installiert (pip install openpyxl)")
-        xlsx = save_dir / (self.excel_name_var.get().strip() or DEFAULT_CONFIG["excel_name"])
-        wb, ws, cols = self._open_sheet(xlsx)
-        r = ws.max_row + 1
-        cal = self.cfg.get("calibration") if self.active_ppm(1) else ""
-        values = {
-            "Datum": now.strftime("%d.%m.%Y"), "Uhrzeit": now.strftime("%H:%M:%S"),
-            "Fall-Nr.": self.case_id, "Bild-Nr.": img_no,
-            "Hersteller": self.hersteller_var.get().strip(),
-            "Leiterplatte / Artikel-Nr.": self.artikel_var.get().strip(),
-            "Serien-/Auftrags-Nr.": self.serie_var.get().strip(),
-            "Fehlerart": self.fehlerart(),
-            "Schadensbeschreibung": self.desc_text.get("1.0", "end").strip(),
-            "Vergrößerung": cal,
-            "Bearbeiter": self.bearbeiter_var.get().strip(),
-            "Dateiname": img_path.name,
-        }
-        for name, v in values.items():
-            cell = ws.cell(row=r, column=cols[name], value=v)
-            cell.alignment = Alignment(vertical="top", wrap_text=(name == "Schadensbeschreibung"))
-        link = ws.cell(row=r, column=cols["Link"], value="Bild öffnen")
-        link.hyperlink = str(img_path)
-        link.font = Font(color="0563C1", underline="single")
-        link.alignment = Alignment(vertical="top")
+        def work():
+            try:
+                findings = self.store.findings(root_dir, excel_name, fa)
+                if not findings:
+                    raise LookupError(f"Zu FA {fa} gibt es noch keine Einträge in der Excel-Liste.")
+                name = f"Schadensbericht_FA{storage.fa_folder(fa)}_{datetime.now():%Y-%m-%d_%H-%M}.pdf"
+                out = root_dir / storage.fa_folder(fa) / name
+                try:
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    report.make_report(fa, findings, out, author)
+                except OSError:           # Server weg -> lokal ablegen
+                    out = storage.local_data_dir() / "berichte" / name
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    report.make_report(fa, findings, out, author)
+                log.info("PDF-Bericht erstellt: %s (%s Befunde)", out, len(findings))
+                res = (True, out, len(findings))
+            except Exception as e:
+                log.error("PDF-Bericht FA %s fehlgeschlagen: %s", fa, e)
+                res = (False, str(e), 0)
+            self.root.after(0, lambda: self._pdf_done(fa, pending, *res))
 
-        thumb_dir = save_dir / ".thumbs"
-        if self.thumb_var.get():
-            if not thumb_dir.exists():
-                thumb_dir.mkdir()
-                hide_dir(thumb_dir)
-            h, w = img.shape[:2]
-            tw = int(w * THUMB_HEIGHT / h)
-            cv2.imencode(".jpg", cv2.resize(img, (tw, THUMB_HEIGHT), interpolation=cv2.INTER_AREA),
-                         [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tofile(str(thumb_dir / (img_path.stem + ".jpg")))
-        self._place_thumbs(ws, cols, thumb_dir)
-        wb.save(xlsx)
-        return xlsx
+        threading.Thread(target=work, daemon=True).start()
 
-    def remove_excel_row(self, xlsx, filename):
-        wb, ws, cols = self._open_sheet(xlsx)
-        for row in range(ws.max_row, 1, -1):
-            if ws.cell(row=row, column=cols["Dateiname"]).value == filename:
-                ws.delete_rows(row)
-                break
-        self._place_thumbs(ws, cols, xlsx.parent / ".thumbs")
-        wb.save(xlsx)
+    def _pdf_done(self, fa, pending, ok, result, count):
+        if not ok:
+            self.set_status(f"PDF-Bericht: {result}", ERR)
+            self.toast("PDF-Bericht nicht möglich", ERR, ok=False)
+            return
+        hint = f"  ·  {pending} Aufnahme(n) noch im Puffer, nicht enthalten" if pending else ""
+        self.set_status(f"PDF-Bericht FA {fa} mit {count} Befund(en): {Path(result).name}{hint}",
+                        OK_GREEN if not pending else WARN)
+        self.toast(f"PDF-Bericht FA {fa} erstellt", OK_GREEN)
+        try:
+            os.startfile(result)
+        except OSError:
+            pass
 
     def on_close(self):
         self.persist()

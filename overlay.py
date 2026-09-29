@@ -42,6 +42,42 @@ def hex_bgr(color):
     return b, g, r
 
 
+# ---------------- Bildanpassung (Software, funktioniert mit jeder Capture-Card) ----------------
+DEFAULT_ADJUST = {"brightness": 0, "contrast": 1.0, "saturation": 1.0, "wb": [1.0, 1.0, 1.0]}
+
+
+def is_neutral(adj):
+    return (not adj or (adj.get("brightness", 0) == 0 and adj.get("contrast", 1) == 1
+                        and adj.get("saturation", 1) == 1 and list(adj.get("wb", [1, 1, 1])) == [1, 1, 1]))
+
+
+def apply_adjust(bgr, adj):
+    """Helligkeit (-100..100), Kontrast (0.5..2), Sättigung (0..2), Weißabgleich (Faktoren B, G, R)."""
+    if is_neutral(adj):
+        return bgr
+    img = bgr.astype(np.float32)
+    wb = adj.get("wb", [1, 1, 1])
+    if list(wb) != [1, 1, 1]:
+        img *= np.array(wb, dtype=np.float32).reshape(1, 1, 3)
+    c, b = float(adj.get("contrast", 1)), float(adj.get("brightness", 0))
+    if c != 1 or b != 0:
+        img = (img - 128.0) * c + 128.0 + b * 1.28
+    s = float(adj.get("saturation", 1))
+    if s != 1:
+        gray = img @ np.array([0.114, 0.587, 0.299], dtype=np.float32)
+        img = gray[..., None] + (img - gray[..., None]) * s
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+def measure_white_balance(bgr):
+    """Weißabgleich aus der Bildmitte (weiße/graue Fläche): Faktoren je Kanal (B, G, R), Grün = 1."""
+    h, w = bgr.shape[:2]
+    roi = bgr[h // 4: 3 * h // 4, w // 4: 3 * w // 4].reshape(-1, 3).astype(np.float32)
+    bright = roi[roi.sum(axis=1) > np.percentile(roi.sum(axis=1), 50)]   # hellere Hälfte = Referenzfläche
+    mb, mg, mr = np.maximum(bright.mean(axis=0), 1.0)
+    return [round(float(mg / mb), 3), 1.0, round(float(mg / mr), 3)]
+
+
 # ---------------- Längen / Maßstab ----------------
 def format_length(mm):
     if mm < 1:

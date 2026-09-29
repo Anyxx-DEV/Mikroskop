@@ -1,0 +1,52 @@
+{
+  "camera_index": 0,
+  "camera_name": "eMeet Nova",
+  "resolution": "3840x2160",
+  "save_dir": "C:\\Users\\t.breitling\\Pictures\\Camera Roll",
+  "excel_name": "Schadensdokumentation.xlsx",
+  "excel_enabled": true,
+  "excel_thumbnail": true,
+  "image_format": "png",
+  "bearbeiter": "t.breitling",
+  "appearance": "Dark",
+  "video_mode": "Auto",
+  "fehlerarten": [
+    "Kratzer",
+    "Lötfehler",
+    "Lötbrücke / Kurzschluss",
+    "Lifted Lead",
+    "Tombstone",
+    "Fehlendes Bauteil",
+    "Falsches / verdrehtes Bauteil",
+    "Verfärbung",
+    "Delamination",
+    "Riss / Bruch",
+    "Verschmutzung",
+    "Sonstiges"
+  ],
+  "calibrations": {},
+  "calibration": "",
+  "annotate_after": true,
+  "overlay_info": true,
+  "overlay_scale": true,
+  "crosshair": false,
+  "live_scale": false,
+  "server_user": "se-elektronic.local\\smd",
+  "server_drive": "N:",
+  "sql": {
+    "server": "W2K19-SRV16\\BW71",
+    "database": "SE_Tools",
+    "user": "Tapi"
+  },
+  "image_adjust": {
+    "brightness": 0,
+    "contrast": 1.0,
+    "saturation": 1.0,
+    "wb": [
+      1.0,
+      1.0,
+      1.0
+    ]
+  },
+  "hersteller_history": []
+}

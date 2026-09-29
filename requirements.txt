@@ -4,3 +4,4 @@ openpyxl
 pygrabber
 customtkinter
 numpy
+pyodbc

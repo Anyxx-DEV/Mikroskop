@@ -181,6 +181,19 @@ def _zoom_out(p):
     p.line((7.5, 10.5), (13.5, 10.5))
 
 
+def _search(p):
+    p.circle(10.5, 10.5, 6.8)
+    p.line((15.5, 15.5), (20.5, 20.5))
+
+
+def _database(p):
+    p.d.ellipse([5 * p.k, 3 * p.k, 19 * p.k, 8 * p.k], outline=p.c, width=p.w)
+    p.line((5, 5.5), (5, 18.5))
+    p.line((19, 5.5), (19, 18.5))
+    for y in (12, 18.5):
+        p.d.arc([5 * p.k, (y - 2.5) * p.k, 19 * p.k, (y + 2.5) * p.k], 0, 180, fill=p.c, width=p.w)
+
+
 def _crosshair(p):
     p.circle(12, 12, 6.5)
     p.line((12, 2.5), (12, 8))
@@ -266,6 +279,7 @@ _ICONS = {
     "zoom_in": _zoom_in, "zoom_out": _zoom_out, "crosshair": _crosshair, "ruler": _ruler,
     "fullscreen": _fullscreen, "help": _help, "arrow": _arrow, "circle": _circle, "square": _square,
     "text": _text, "undo": _undo, "trash": _trash, "plus": _plus, "x": _x, "tag": _tag,
+    "search": _search, "database": _database,
 }
 
 

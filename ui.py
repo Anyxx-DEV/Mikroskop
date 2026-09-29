@@ -72,13 +72,14 @@ def focus_ring(widget):
     return widget
 
 
-def set_error(widget, label, message):
-    """Feld rot markieren und Hinweis darunter anzeigen (message=None -> zurücksetzen)."""
+def set_error(widget, label, message, after=None):
+    """Feld rot markieren und Hinweis darunter anzeigen (message=None -> zurücksetzen).
+    after: Element, hinter dem der Hinweis erscheint (Standard: das Feld selbst)."""
     widget._err = bool(message)
     widget.configure(border_color=ERR if message else BORDER_STRONG, border_width=2 if message else 1)
     if message:
         label.configure(text=message)
-        label.pack(fill="x", pady=(4, 0), after=widget)
+        label.pack(fill="x", pady=(4, 0), after=after or widget)
     else:
         label.pack_forget()
 
@@ -156,10 +157,88 @@ class Card(ctk.CTkFrame):
         self.body.pack(fill="x", padx=16, pady=(0, 16))
 
 
+class SuggestPopup:
+    """
+    Vorschlagsliste unter einem Eingabefeld (wie Autovervollständigung).
+    items = [(Text, Nutzdaten), ...]; Auswahl per Klick oder Pfeiltasten + Enter -> on_pick(Nutzdaten).
+    """
+
+    def __init__(self, anchor, on_pick, width_widget=None):
+        self.anchor = anchor                  # Feld, unter dem die Liste erscheint
+        self.width_widget = width_widget or anchor
+        self.on_pick = on_pick
+        self.win = None
+        self.items = []
+        self.rows = []
+        self.sel = -1
+
+    @property
+    def visible(self):
+        return bool(self.win and self.win.winfo_viewable())
+
+    def show(self, items, header=None):
+        self.items = items
+        self.sel = -1
+        if not items:
+            self.hide()
+            return
+        if self.win is None:
+            self.win = tk.Toplevel(self.anchor)
+            self.win.overrideredirect(True)
+            self.win.attributes("-topmost", True)
+            self.frame = ctk.CTkFrame(self.win, fg_color=CARD, corner_radius=0, border_width=1,
+                                      border_color=ACCENT)
+            self.frame.pack(fill="both", expand=True)
+        self.win.configure(bg=mode_color(CARD))
+        for w in self.frame.winfo_children():
+            w.destroy()
+        if header:
+            ctk.CTkLabel(self.frame, text=header, text_color=MUTED, font=F(11, "bold"), anchor="w",
+                         height=22).pack(fill="x", padx=10, pady=(6, 0))
+        self.rows = []
+        for i, (text, _) in enumerate(items):
+            b = ctk.CTkButton(self.frame, text=text, anchor="w", height=32, corner_radius=6,
+                              fg_color="transparent", hover_color=SECONDARY, text_color=FG,
+                              font=F(12, family=FONT_MONO), cursor="hand2",
+                              command=lambda i=i: self.pick(i))
+            b.pack(fill="x", padx=4, pady=1)
+            self.rows.append(b)
+        ctk.CTkFrame(self.frame, height=4, fg_color="transparent").pack()
+        a, w = self.anchor, self.width_widget
+        a.update_idletasks()
+        x, y = a.winfo_rootx(), a.winfo_rooty() + a.winfo_height() + 2
+        width = max(w.winfo_rootx() + w.winfo_width() - x, 300)
+        self.win.update_idletasks()
+        self.win.geometry(f"{width}x{self.frame.winfo_reqheight()}+{x}+{y}")
+        self.win.deiconify()
+        self.win.lift()
+
+    def move(self, step):
+        if not self.rows:
+            return
+        self.sel = (self.sel + step) % len(self.rows)
+        for i, b in enumerate(self.rows):
+            b.configure(fg_color=SECONDARY if i == self.sel else "transparent")
+
+    def pick(self, i=None):
+        i = self.sel if i is None else i
+        if 0 <= i < len(self.items):
+            payload = self.items[i][1]
+            self.hide()
+            self.on_pick(payload)
+            return True
+        return False
+
+    def hide(self):
+        if self.win is not None:
+            self.win.withdraw()
+        self.sel = -1
+
+
 def ask_form(master, title, fields, ok_text="OK", message=None):
     """
     Kleiner modaler Dialog mit Eingabefeldern.
-    fields = [(Beschriftung, Vorgabewert), ...]  ->  Liste der Eingaben oder None (Abbruch)
+    fields = [(Beschriftung, Vorgabewert[, verdeckt]), ...]  ->  Liste der Eingaben oder None (Abbruch)
     """
     prev_grab = master.grab_current()
     dlg = ctk.CTkToplevel(master)
@@ -176,10 +255,10 @@ def ask_form(master, title, fields, ok_text="OK", message=None):
         ctk.CTkLabel(body, text=message, text_color=MUTED, font=F(12), anchor="w", justify="left",
                      wraplength=380).pack(fill="x", pady=(6, 0))
     vars_, entries = [], []
-    for label, default in fields:
+    for label, default, *opts in fields:     # optional 3. Wert True = Passwortfeld (verdeckt)
         field_label(body, label)
         v = tk.StringVar(value=default)
-        e = entry(body, v, width=380)
+        e = entry(body, v, width=380, **({"show": "•"} if opts and opts[0] else {}))
         e.pack(fill="x")
         vars_.append(v)
         entries.append(e)
