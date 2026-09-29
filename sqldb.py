@@ -216,6 +216,30 @@ def lookup_bauteile(cfg, kopf_artikel_nr):
     return [(lbl, items[lbl]) for lbl in sorted(items, key=natural)], m
 
 
+def all_bauteile(cfg):
+    """
+    Alle Bauteile aus allen Stücklisten (je Artikel-Nr. einmal) für die Suche über die ganze Datenbank:
+    [(Anzeigetext, Details), ...]. Wird einmal geladen und im Programm zwischengespeichert.
+    """
+    with connect(cfg["server"], cfg["database"], cfg["user"], timeout=10) as conn:
+        m = bom_columns(conn, cfg)
+        if not m.get("artnr"):
+            return []
+        extra = [k for k in ("bez",) + DETAIL_KEYS if m.get(k)]
+        sel = ", ".join([f"[{m['artnr']}]"] + [f"MAX([{m[k]}])" for k in extra])
+        sql = (f"SELECT {sel} FROM {BOM_TABLE} WHERE [{m['artnr']}] IS NOT NULL "
+               f"AND LTRIM(RTRIM([{m['artnr']}])) <> '' GROUP BY [{m['artnr']}]")
+        rows = conn.cursor().execute(sql).fetchall()
+    out = []
+    for r in rows:
+        det = {"pos": "", "artnr": str(r[0]).strip(), "bez": "", "package": "", "technology": "", "type": ""}
+        det.update({k: (str(v).strip() if v is not None else "") for k, v in zip(extra, r[1:])})
+        label = "  ·  ".join(det[k] for k in ("artnr", "bez") if det[k])
+        out.append((label, det))
+    out.sort(key=lambda x: x[0])
+    return out
+
+
 def test_connection(server, database, user, password=None):
     with connect(server, database, user, password) as conn:
         n = conn.cursor().execute("SELECT COUNT(*) FROM [dbo].[SMD_FA_Fehler]").fetchone()[0]

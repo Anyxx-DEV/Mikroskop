@@ -255,6 +255,7 @@ class App:
         self.start_camera()
         self.check_server()
         self._update_buffer_badge(self.store.pending_count())
+        self.root.after(2000, self.load_global_bauteile)     # Bauteil-Suche über alle Stücklisten vorbereiten
         self.root.after(RETRY_MS, self._retry_timer)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.update_preview()
@@ -454,7 +455,7 @@ class App:
         self.artikel_entry.bind("<Return>", lambda e: self.load_bauteile(), add="+")
 
         # Bauteil aus der Stückliste (wird nach dem Laden der Platinen-Nr. gefüllt, Tippen filtert)
-        field_label(b, "Bauteil (aus Stückliste)  –  tippen zum Filtern")
+        field_label(b, "Bauteil   –   tippen für Vorschläge (Nr., Bezeichnung, Position)")
         self.bauteil_var = tk.StringVar()
         self._bauteile = []
         self.bauteil_combo = focus_ring(ctk.CTkComboBox(
@@ -479,6 +480,7 @@ class App:
         self.bauteil_info.pack(fill="x", pady=(4, 0))
         # Details des gewählten Bauteils (Gehäuse, Technologie, Typ) aus der Stückliste
         self._bauteil_details = {}
+        self._global_details, self._global_index, self._global_state = {}, [], None
         self.bauteil_detail = ctk.CTkLabel(b, text="", text_color=FG, fg_color=SECONDARY, corner_radius=8,
                                            font=F(12), anchor="w", justify="left", wraplength=330, padx=10)
         self.bauteil_var.trace_add("write", lambda *a: self._show_bauteil_detail())
@@ -1099,7 +1101,35 @@ class App:
 
     def bauteil_details(self):
         """Details des gewählten Bauteils (leer, wenn frei eingetippt)."""
-        return self._bauteil_details.get(self.bauteil_var.get().strip(), {})
+        lbl = self.bauteil_var.get().strip()
+        return self._bauteil_details.get(lbl) or self._global_details.get(lbl, {})
+
+    # ---- alle Bauteile der Datenbank (für die Suche über alle Stücklisten) ----
+    def load_global_bauteile(self):
+        if self._global_state in ("loading", "ok") or not self._sql_ready():
+            return
+        self._global_state = "loading"
+        cfg = dict(self._sql_cfg())
+
+        def work():
+            try:
+                items, err = sqldb.all_bauteile(cfg), None
+            except Exception as e:
+                items, err = [], str(e)
+            self.root.after(0, lambda: self._global_loaded(items, err))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _global_loaded(self, items, err):
+        if err:
+            self._global_state = "error"          # beim nächsten Tippen erneut versuchen
+            log.error("Bauteil-Liste (alle Stücklisten) nicht ladbar: %s", err)
+            return
+        norm = lambda s: s.lower().replace(" ", "")
+        self._global_index = [(lbl, norm(d["artnr"]), norm(d["bez"])) for lbl, d in items]
+        self._global_details = dict(items)
+        self._global_state = "ok"
+        log.info("Bauteil-Liste geladen: %s Artikel aus allen Stücklisten", len(items))
 
     def _show_bauteil_detail(self):
         d = self.bauteil_details()
@@ -1128,33 +1158,69 @@ class App:
                 contains.append(lbl)
         return starts + contains
 
+    def _match_global(self, text, exclude, limit=10):
+        """Treffer aus allen Stücklisten (ohne die der aktuellen Platine), 'beginnt mit' zuerst."""
+        text = text.lower().replace(" ", "")
+        if not text or self._global_state != "ok":
+            return [], 0
+        starts, contains, total = [], [], 0
+        for lbl, a, b in self._global_index:
+            if lbl in exclude:
+                continue
+            if a.startswith(text) or b.startswith(text):
+                total += 1
+                if len(starts) < limit:
+                    starts.append(lbl)
+            elif text in a or text in b:
+                total += 1
+                if len(contains) < limit:
+                    contains.append(lbl)
+        return (starts + contains)[:limit], total
+
     def _filter_bauteile(self, event):
         if event.keysym in ("Return", "KP_Enter", "Up", "Down", "Left", "Right", "Tab", "Escape",
                             "Shift_L", "Shift_R", "Control_L", "Control_R"):
             return
+        if self._global_state in (None, "error"):
+            self.load_global_bauteile()
         text = self.bauteil_var.get()
         hits = self._match_bauteile(text)
         self.bauteil_combo.configure(values=hits[:self.MAX_BAUTEIL_ITEMS] or [""])
-        if not self._bauteile:
-            return
-        self.bauteil_info.configure(text=f"{len(hits)} von {len(self._bauteile)} Bauteilen passen.",
-                                    text_color=MUTED if hits else WARN)
-        if not text.strip() or text.strip() in self._bauteil_details:
+        if not text.strip() or text.strip() in self._bauteil_details or text.strip() in self._global_details:
             self.bauteil_suggest.hide()
             return
+        # zuerst die Stückliste dieser Platine, danach passende Bauteile aus allen anderen Stücklisten
+        own = hits[:10]
+        other, other_total = self._match_global(text, set(self._bauteil_details), limit=12 - min(len(own), 6))
+        own = own[:12 - len(other)] if other else own
+        parts = []
+        if self._bauteile:
+            parts.append(f"{len(hits)} in der Stückliste dieser Platine")
+        if self._global_state == "ok":
+            parts.append(f"{other_total} in anderen Stücklisten")
+        elif self._global_state == "loading":
+            parts.append("Datenbank wird geladen…")
+        self.bauteil_info.configure(text=" · ".join(parts) + ".", text_color=MUTED if (hits or other) else WARN)
         items = []
-        for lbl in hits[:10]:
+        for lbl in own:
             pos = self._bauteil_details.get(lbl, {}).get("pos", "")
             if len(pos) > 18:
                 pos = pos[:17] + "…"
             items.append((f"{lbl}" + (f"   [{pos}]" if pos else ""), lbl))
-        header = f"Bauteile aus der Stückliste  ·  {len(hits)} Treffer  ·  ↑↓ + Enter oder klicken"
+        for lbl in other:
+            items.append((f"{lbl}   (andere)", lbl))
+        header = ("Zuerst diese Platine, dann „(andere)“ Stücklisten  ·  ↑↓ + Enter" if other
+                  else "Vorschläge  ·  ↑↓ + Enter oder klicken")
         self.bauteil_suggest.show(items, header=header if items else None)
 
     def _pick_bauteil(self, label):
         self.bauteil_var.set(label)
         self.bauteil_combo.configure(values=self._bauteile[:self.MAX_BAUTEIL_ITEMS] or [""])
-        self.bauteil_info.configure(text=f"{len(self._bauteile)} Bauteile aus der Stückliste.", text_color=MUTED)
+        if label in self._bauteil_details:
+            self.bauteil_info.configure(text=f"Aus der Stückliste dieser Platine ({len(self._bauteile)} Bauteile).",
+                                        text_color=MUTED)
+        else:
+            self.bauteil_info.configure(text="Hinweis: Bauteil stammt aus einer anderen Stückliste.", text_color=WARN)
         self.bauteil_combo.focus_set()
 
     def _bauteil_nav(self, step):
