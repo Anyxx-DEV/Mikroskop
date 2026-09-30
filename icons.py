@@ -194,6 +194,14 @@ def _database(p):
         p.d.arc([5 * p.k, (y - 2.5) * p.k, 19 * p.k, (y + 2.5) * p.k], 0, 180, fill=p.c, width=p.w)
 
 
+def _chevron_down(p):
+    p.line((6, 9.5), (12, 15.5), (18, 9.5))
+
+
+def _chevron_right(p):
+    p.line((9.5, 6), (15.5, 12), (9.5, 18))
+
+
 def _crosshair(p):
     p.circle(12, 12, 6.5)
     p.line((12, 2.5), (12, 8))
@@ -279,7 +287,7 @@ _ICONS = {
     "zoom_in": _zoom_in, "zoom_out": _zoom_out, "crosshair": _crosshair, "ruler": _ruler,
     "fullscreen": _fullscreen, "help": _help, "arrow": _arrow, "circle": _circle, "square": _square,
     "text": _text, "undo": _undo, "trash": _trash, "plus": _plus, "x": _x, "tag": _tag,
-    "search": _search, "database": _database,
+    "search": _search, "database": _database, "chevron_down": _chevron_down, "chevron_right": _chevron_right,
 }
 
 

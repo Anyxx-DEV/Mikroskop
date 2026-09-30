@@ -15,7 +15,7 @@ import ui
 from overlay import length_label, text_size
 
 TOOLS = [("arrow", "Pfeil"), ("circle", "Kreis"), ("square", "Rechteck"), ("text", "Text"), ("ruler", "Messen")]
-COLORS = [("#EF4444", "Rot"), ("#FACC15", "Gelb"), ("#22D3EE", "Cyan"), ("#FFFFFF", "Weiß")]
+COLORS = [("#DD042D", "SE-Rot"), ("#FACC15", "Gelb"), ("#22D3EE", "Cyan"), ("#FFFFFF", "Weiß")]
 
 
 class AnnotateDialog(ctk.CTkToplevel):

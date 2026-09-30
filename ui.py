@@ -144,17 +144,47 @@ def keycap(master, text):
 
 
 class Card(ctk.CTkFrame):
-    """Karte mit Icon-Überschrift; rechts in .head können weitere Elemente ergänzt werden."""
+    """
+    Karte mit Icon-Überschrift; rechts in .head können weitere Elemente ergänzt werden.
+    collapsible=True: Klick auf die Überschrift klappt den Inhalt ein/aus (hint = Kurzinfo im eingeklappten Zustand).
+    """
 
-    def __init__(self, master, title, icon):
+    def __init__(self, master, title, icon, collapsible=False, collapsed=False, hint=""):
         super().__init__(master, fg_color=CARD, corner_radius=12, border_width=1, border_color=BORDER)
         self.head = ctk.CTkFrame(self, fg_color="transparent")
         self.head.pack(fill="x", padx=16, pady=(14, 2))
-        ctk.CTkLabel(self.head, text="", image=ctk_icon(icon, 18, MUTED), width=20).pack(side="left")
-        ctk.CTkLabel(self.head, text=title, anchor="w", text_color=FG,
-                     font=F(14, "bold")).pack(side="left", padx=(8, 0))
+        parts = [ctk.CTkLabel(self.head, text="", image=ctk_icon(icon, 18, MUTED), width=20),
+                 ctk.CTkLabel(self.head, text=title, anchor="w", text_color=FG, font=F(14, "bold"))]
+        parts[0].pack(side="left")
+        parts[1].pack(side="left", padx=(8, 0))
         self.body = ctk.CTkFrame(self, fg_color="transparent")
-        self.body.pack(fill="x", padx=16, pady=(0, 16))
+        self.collapsed = False
+        if collapsible:
+            self.chevron = ctk.CTkLabel(self.head, text="", width=20)
+            self.chevron.pack(side="right")
+            self.hint = ctk.CTkLabel(self.head, text=hint, text_color=MUTED, font=F(12), anchor="e")
+            parts += [self.chevron, self.hint]
+            for w in [self.head] + parts:
+                w.configure(cursor="hand2")
+                w.bind("<Button-1>", lambda e: self.toggle())
+            self._set_collapsed(collapsed)
+        else:
+            self.body.pack(fill="x", padx=16, pady=(0, 16))
+
+    def toggle(self):
+        self._set_collapsed(not self.collapsed)
+
+    def _set_collapsed(self, collapsed):
+        self.collapsed = collapsed
+        self.chevron.configure(image=ctk_icon("chevron_right" if collapsed else "chevron_down", 18, MUTED))
+        if collapsed:
+            self.body.pack_forget()
+            self.head.pack_configure(pady=14)
+            self.hint.pack(side="right", padx=(0, 6))
+        else:
+            self.head.pack_configure(pady=(14, 2))
+            self.hint.pack_forget()
+            self.body.pack(fill="x", padx=16, pady=(0, 16))
 
 
 class SuggestPopup:

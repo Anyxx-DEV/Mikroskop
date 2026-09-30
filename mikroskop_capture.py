@@ -247,6 +247,7 @@ class App:
         root.title(APP_NAME)
         root.geometry("1480x920")
         root.minsize(1150, 760)
+        root.after(50, lambda: root.state("zoomed"))    # maximiert starten -> mehr Platz für Bild und Formular
         root.configure(fg_color=BG)
         self._set_window_icon()
         self._build_ui()
@@ -369,17 +370,31 @@ class App:
                                         text_color=MUTED, font=F(13))
         self.strip_empty.pack(pady=34)
 
-        # ---- Rechts: Einstellungen ----
-        self.side = side = ctk.CTkScrollableFrame(r, width=390, fg_color="transparent",
-                                                  scrollbar_button_color=SECONDARY,
-                                                  scrollbar_button_hover_color=SECONDARY_HOVER)
-        side.grid(row=1, column=1, sticky="ns", padx=(10, 14), pady=(4, 0))
-        self._build_board_card(side)
-        self._build_measure_card(side)
-        self._build_camera_card(side)
-        self._build_image_card(side)
-        self._build_storage_card(side)
-        self._build_sql_card(side)
+        # ---- Rechts: zwei Reiter - "Erfassung" (bei jedem Foto) und "Einstellungen" (selten) ----
+        self.side = right = ctk.CTkFrame(r, fg_color="transparent")
+        right.grid(row=1, column=1, sticky="ns", padx=(10, 14), pady=(4, 0))
+        self.tab_seg = ctk.CTkSegmentedButton(
+            right, values=["Erfassung", "Einstellungen"], height=38, corner_radius=10, font=F(13, "bold"),
+            fg_color=(SECONDARY[0], FIELD[1]), unselected_color=(SECONDARY[0], FIELD[1]),
+            unselected_hover_color=SECONDARY_HOVER, selected_color=("#FFFFFF", "#475569"),
+            selected_hover_color=("#FFFFFF", "#475569"), text_color=FG, command=self.show_tab)
+        self.tab_seg.pack(fill="x", padx=(0, 16), pady=(0, 10))
+
+        def scroll_area():
+            return ctk.CTkScrollableFrame(right, width=390, fg_color="transparent",
+                                          scrollbar_button_color=SECONDARY,
+                                          scrollbar_button_hover_color=SECONDARY_HOVER)
+        self.tabs = {"Erfassung": scroll_area(), "Einstellungen": scroll_area()}
+        self._build_board_card(self.tabs["Erfassung"])
+        s = self.tabs["Einstellungen"]
+        ctk.CTkLabel(s, text="Zum Öffnen auf einen Abschnitt klicken.", text_color=MUTED, font=F(12),
+                     anchor="w").pack(fill="x", padx=4, pady=(0, 8))
+        self._build_camera_card(s)
+        self._build_image_card(s)
+        self._build_measure_card(s)
+        self._build_storage_card(s)
+        self._build_sql_card(s)
+        self.show_tab("Erfassung")
 
         # ---- Aufnahme-Button (immer sichtbar) ----
         self.cap_frame = cap = ctk.CTkFrame(r, fg_color="transparent")
@@ -497,11 +512,23 @@ class App:
 
         field_label(b, "Schadensbeschreibung")
         self.desc_text = focus_ring(ctk.CTkTextbox(
-            b, height=80, wrap="word", corner_radius=8, fg_color=FIELD, border_color=BORDER_STRONG,
+            b, height=64, wrap="word", corner_radius=8, fg_color=FIELD, border_color=BORDER_STRONG,
             border_width=1, text_color=FG, font=F(13)))
         self.desc_text.pack(fill="x")
-        field_label(b, "Bearbeiter")
-        entry(b, self.bearbeiter_var).pack(fill="x")
+
+        # Vergrößerung + Bearbeiter nebeneinander (Vergrößerung beim Zoomen am Mikroskop mit umstellen)
+        grid = ctk.CTkFrame(b, fg_color="transparent")
+        grid.pack(fill="x")
+        grid.grid_columnconfigure((0, 1), weight=1, uniform="f")
+        cell = ctk.CTkFrame(grid, fg_color="transparent")
+        cell.grid(row=0, column=0, sticky="new", padx=(0, 6))
+        field_label(cell, "Vergrößerung")
+        self.calib_menu = option(cell, [NOT_CALIBRATED], self._select_calibration, dynamic_resizing=False)
+        self.calib_menu.pack(fill="x")
+        cell = ctk.CTkFrame(grid, fg_color="transparent")
+        cell.grid(row=0, column=1, sticky="new", padx=(6, 0))
+        field_label(cell, "Bearbeiter")
+        entry(cell, self.bearbeiter_var).pack(fill="x")
         row = ctk.CTkFrame(b, fg_color="transparent")
         row.pack(fill="x", pady=(14, 0))
         row.grid_columnconfigure((0, 1), weight=1, uniform="c")
@@ -512,12 +539,13 @@ class App:
         self._update_case_label()
 
     def _build_measure_card(self, side):
-        card = Card(side, "Messen & Beschriftung", "ruler")
-        card.pack(fill="x", pady=(0, 12))
+        card = Card(side, "Messen & Beschriftung", "ruler", collapsible=True, collapsed=True,
+                    hint="Kalibrieren, Foto-Optionen")
+        card.pack(fill="x", pady=(0, 10))
         b = card.body
-        field_label(b, "Vergrößerung / Kalibrierung")
-        self.calib_menu = option(b, [NOT_CALIBRATED], self._select_calibration, dynamic_resizing=False)
-        self.calib_menu.pack(fill="x")
+        ctk.CTkLabel(b, text="Die Vergrößerung wird im Reiter „Erfassung“ gewählt. Hier wird die aktuell "
+                             "gewählte Vergrößerung kalibriert.", text_color=MUTED, font=F(12), anchor="w",
+                     justify="left", wraplength=340).pack(fill="x", pady=(8, 0))
         self.calib_info = ctk.CTkLabel(b, text="", text_color=MUTED, font=F(12), anchor="w", justify="left",
                                        wraplength=340)
         self.calib_info.pack(fill="x", pady=(6, 0))
@@ -536,8 +564,9 @@ class App:
             switch(b, text, var).pack(anchor="w", pady=(pad, 0))
 
     def _build_camera_card(self, side):
-        card = Card(side, "Kamera / Capture-Card", "video")
-        card.pack(fill="x", pady=(0, 12))
+        card = Card(side, "Kamera / Capture-Card", "video", collapsible=True, collapsed=True,
+                    hint="Gerät, Auflösung")
+        card.pack(fill="x", pady=(0, 10))
         b = card.body
         field_label(b, "Gerät")
         row = ctk.CTkFrame(b, fg_color="transparent")
@@ -562,8 +591,9 @@ class App:
 
     def _build_image_card(self, side):
         """Helligkeit, Kontrast, Sättigung, Weißabgleich - in Software, wirkt auf Vorschau und Foto."""
-        card = Card(side, "Bildeinstellungen", "sliders")
-        card.pack(fill="x", pady=(0, 12))
+        card = Card(side, "Bildeinstellungen", "sliders", collapsible=True, collapsed=True,
+                    hint="Helligkeit, Weißabgleich")
+        card.pack(fill="x", pady=(0, 10))
         b = card.body
         adj = self.cfg.setdefault("image_adjust", dict(overlay.DEFAULT_ADJUST))
         self._adj_sliders = {}
@@ -649,8 +679,8 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def _build_storage_card(self, side):
-        card = Card(side, "Speicherort", "folder")
-        card.pack(fill="x", pady=(0, 12))
+        card = Card(side, "Speicherort", "folder", collapsible=True, collapsed=True, hint="Server, Excel, Log")
+        card.pack(fill="x", pady=(0, 10))
         b = card.body
         field_label(b, "Zielordner")
         row = ctk.CTkFrame(b, fg_color="transparent")
@@ -696,8 +726,9 @@ class App:
             self.set_status("Keine Log-Datei vorhanden.", WARN)
 
     def _build_sql_card(self, side):
-        card = Card(side, "Datenbank (SQL Server)", "database")
-        card.pack(fill="x", pady=(0, 12))
+        card = Card(side, "Datenbank (SQL Server)", "database", collapsible=True, collapsed=True,
+                    hint="Verbindung")
+        card.pack(fill="x", pady=(0, 10))
         b = card.body
         c = self.cfg.setdefault("sql", dict(DEFAULT_CONFIG["sql"]))
         self.sql_vars = {}
@@ -756,6 +787,14 @@ class App:
             self.root.after(0, lambda: self._update_sql_info(*res))
 
         threading.Thread(target=work, daemon=True).start()
+
+    def show_tab(self, name):
+        self.tab_seg.set(name)
+        for n, frame in self.tabs.items():
+            if n == name:
+                frame.pack(fill="both", expand=True)
+            else:
+                frame.pack_forget()
 
     # ================= Offline-Puffer =================
     def _update_buffer_badge(self, n):
@@ -1021,7 +1060,7 @@ class App:
             self._fa_error("Bitte FA-Nr. eingeben oder scannen")
             return
         if not self._sql_ready():
-            self._fa_error("Datenbank nicht eingerichtet – unten unter „Datenbank“")
+            self._fa_error("Datenbank nicht eingerichtet – Reiter „Einstellungen“ → „Datenbank“")
             return
         self.fa_info.configure(text="Suche in der Datenbank…", text_color=MUTED)
         self.fa_info.pack(fill="x", pady=(4, 0), after=self.fa_entry.master)
@@ -1690,7 +1729,7 @@ class App:
                 title, sub, icon = "Warte auf Bildsignal…", "Videomodus wird automatisch gesucht", "video"
             else:
                 title, sub, icon = ("Keine Kamera aktiv",
-                                    "Capture-Card rechts unter „Kamera“ auswählen und Liste aktualisieren", "video")
+                                    "Reiter „Einstellungen“ → „Kamera“: Capture-Card auswählen", "video")
             c.create_image(cw // 2, ch // 2 - 46, image=self._canvas_icon(icon, 56, muted))
             c.create_text(cw // 2, ch // 2 + 8, fill=mode_color(FG), font=(ui.FONT_UI, 15, "bold"), text=title)
             c.create_text(cw // 2, ch // 2 + 36, fill=muted, font=(ui.FONT_UI, 11), justify="center", text=sub)

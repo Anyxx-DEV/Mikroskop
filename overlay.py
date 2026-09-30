@@ -10,12 +10,15 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-_FONT_FILES = {False: ("segoeui.ttf", "arial.ttf", "DejaVuSans.ttf"),
-               True: ("segoeuib.ttf", "arialbd.ttf", "DejaVuSans-Bold.ttf")}
+# Schrift nach SE-Elektronic Guidelines: Source Sans Pro, sonst Calibri (danach allgemeine Ersatzschriften)
+_FONT_FILES = {False: ("SourceSansPro-Regular.ttf", "SourceSans3-Regular.ttf", "calibri.ttf", "segoeui.ttf",
+                       "arial.ttf", "DejaVuSans.ttf"),
+               True: ("SourceSansPro-Bold.ttf", "SourceSans3-Bold.ttf", "calibrib.ttf", "segoeuib.ttf",
+                      "arialbd.ttf", "DejaVuSans-Bold.ttf")}
 _font_cache = {}
 
-INFO_BG = (15, 23, 42)       # #0F172A
-OUTLINE = (15, 23, 42)
+INFO_BG = (51, 51, 51)       # Dunkelgrau #333333 (Markenpalette)
+OUTLINE = (0, 0, 0)
 
 
 def pil_font(size, bold=False):
