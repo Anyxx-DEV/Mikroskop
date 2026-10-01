@@ -1,7 +1,7 @@
 """
-Anbindung an den SQL Server (nur lesend).
-Nachschlagen eines Fertigungsauftrags (Bel_Nr) in SE_Tools.dbo.SMD_FA_Fehler
--> Platinen-Nr. (Bel_Pos_ArtikelNr) und Artikelbezeichnung der Leiterplatte.
+Anbindung an den SQL Server.
+- lesend: Fertigungsauftrag (SMD_FA_Fehler), Stückliste (tmp_ProduktionsStücklisten_Rekursion)
+- schreibend: Befunde in die eigene Tabelle dbo.SMD_Mikroskop_Befunde (ersetzt die Excel-Liste)
 
 Das Passwort des SQL-Benutzers liegt nicht im Programm, sondern in der
 Windows-Anmeldeinformationsverwaltung (Ziel: "MikroskopCapture/SQL/<Server>").
@@ -78,7 +78,7 @@ def pick_driver():
     return next((d for d in DRIVER_PREFERENCE if d in installed), None)
 
 
-def connect(server, database, user, password=None, timeout=5):
+def connect(server, database, user, password=None, timeout=5, write=False):
     if pyodbc is None:
         raise RuntimeError("Python-Paket 'pyodbc' fehlt (pip install pyodbc).")
     driver = pick_driver()
@@ -93,7 +93,7 @@ def connect(server, database, user, password=None, timeout=5):
         # wie im SQL Server Management Studio: Verschlüsseln = Optional, Serverzertifikat vertrauen
         parts += ["Encrypt=Optional" if driver.startswith("ODBC Driver 18") else "Encrypt=no",
                   "TrustServerCertificate=yes"]
-    return pyodbc.connect(";".join(parts), timeout=timeout, readonly=True)
+    return pyodbc.connect(";".join(parts), timeout=timeout, readonly=not write)
 
 
 def lookup_auftrag(cfg, bel_nr):
@@ -238,6 +238,183 @@ def all_bauteile(cfg):
         out.append((label, det))
     out.sort(key=lambda x: x[0])
     return out
+
+
+# ================= Befunde-Tabelle (ersetzt die Excel-Liste) =================
+BEFUNDE_TABLE = "dbo.SMD_Mikroskop_Befunde"
+BEFUNDE_VIEW = "dbo.SMD_Mikroskop_Befunde_View"   # Sicht im SSMS-Ordner "Sichten" (neben SMD_FA_Fehler)
+OLD_VIEW = "dbo.v_SMD_Mikroskop_Befunde"           # frühere Bezeichnung (wird vom Skript entfernt)
+# Spalten, die das Programm schreibt (Reihenfolge = Reihenfolge im INSERT)
+BEFUND_FIELDS = ["Erfasst", "Bel_Nr", "Fall_Nr", "Bild_Nr", "Platinen_Nr", "Artikelbezeichnung", "Fehlerart",
+                 "Bauteil_ArtikelNr", "Bauteil_Bez", "Position", "Gehaeuse", "Technologie", "Bauteiltyp",
+                 "Beschreibung", "Vergroesserung", "Bearbeiter", "Bildpfad", "Dateiname", "Arbeitsplatz"]
+
+
+def create_table_sql(grant_user=""):
+    """SQL-Skript zum Anlegen der Tabelle (Batches mit GO getrennt)."""
+    # Rechte nur vergeben, wenn es einen eigenen DB-Benutzer gibt (ist er Besitzer/dbo, hat er sie schon)
+    grant = (f"\nGO\nIF EXISTS (SELECT 1 FROM sys.database_principals WHERE name = N'{grant_user}' "
+             f"AND type IN ('S', 'U', 'G') AND name <> USER_NAME())\n"
+             f"BEGIN\n"
+             f"    EXEC(N'GRANT SELECT, INSERT, UPDATE ON {BEFUNDE_TABLE} TO [{grant_user}]');\n"
+             f"    EXEC(N'GRANT SELECT ON {BEFUNDE_VIEW} TO [{grant_user}]');\n"
+             f"END\n"
+             f"ELSE\n    PRINT N'Hinweis: kein eigener Benutzer {grant_user} in dieser Datenbank "
+             f"(z. B. Besitzer/dbo) - keine Rechtevergabe noetig.';" if grant_user else "")
+    return f"""-- Tabelle fuer die Mikroskop-Befunde (Leiterplatten-Schadensdokumentation)
+-- Wird vom Programm Mikroskop-Capture beschrieben. Loeschen = nur markieren (Geloescht = 1).
+IF OBJECT_ID(N'{BEFUNDE_TABLE}', N'U') IS NULL
+BEGIN
+    CREATE TABLE {BEFUNDE_TABLE} (
+        ID                  int IDENTITY(1,1) NOT NULL CONSTRAINT PK_SMD_Mikroskop_Befunde PRIMARY KEY,
+        Erfasst             datetime2(0)   NOT NULL,             -- Datum + Uhrzeit der Aufnahme
+        Bel_Nr              nvarchar(30)   NOT NULL,             -- Fertigungsauftrag
+        Fall_Nr             nvarchar(20)   NULL,
+        Bild_Nr             int            NULL,
+        Platinen_Nr         nvarchar(50)   NULL,
+        Artikelbezeichnung  nvarchar(200)  NULL,
+        Fehlerart           nvarchar(100)  NULL,
+        Bauteil_ArtikelNr   nvarchar(50)   NULL,                 -- SMD_ArtikelNR aus der Stueckliste
+        Bauteil_Bez         nvarchar(200)  NULL,                 -- SMD_Art_Bez (oder Freitext)
+        Position            nvarchar(400)  NULL,                 -- Bestueckposition(en)
+        Gehaeuse            nvarchar(50)   NULL,
+        Technologie         nvarchar(50)   NULL,
+        Bauteiltyp          nvarchar(100)  NULL,
+        Beschreibung        nvarchar(max)  NULL,
+        Vergroesserung      nvarchar(50)   NULL,
+        Bearbeiter          nvarchar(100)  NULL,
+        Bildpfad            nvarchar(400)  NOT NULL,             -- vollstaendiger Pfad zum Foto
+        Dateiname           nvarchar(200)  NOT NULL,
+        Arbeitsplatz        nvarchar(50)   NULL,                 -- PC-Name
+        Angelegt_am         datetime2(0)   NOT NULL CONSTRAINT DF_SMD_Mikroskop_Befunde_Angelegt DEFAULT SYSDATETIME(),
+        Geloescht           bit            NOT NULL CONSTRAINT DF_SMD_Mikroskop_Befunde_Geloescht DEFAULT 0,
+        Geloescht_am        datetime2(0)   NULL,
+        Geloescht_von       nvarchar(100)  NULL
+    );
+    CREATE UNIQUE INDEX UX_SMD_Mikroskop_Befunde_Bildpfad ON {BEFUNDE_TABLE} (Bildpfad);
+    CREATE INDEX IX_SMD_Mikroskop_Befunde_BelNr ON {BEFUNDE_TABLE} (Bel_Nr, Erfasst);
+    CREATE INDEX IX_SMD_Mikroskop_Befunde_Erfasst ON {BEFUNDE_TABLE} (Erfasst DESC);
+END
+GO
+-- fruehere Sicht-Bezeichnung entfernen (nur die Sicht - die Daten liegen in der Tabelle)
+DROP VIEW IF EXISTS {OLD_VIEW};
+GO
+-- Sicht (Ordner "Sichten"): nur gueltige Befunde, lesbar aufbereitet - fuer Abfragen, Excel, Power BI
+CREATE OR ALTER VIEW {BEFUNDE_VIEW} AS
+SELECT  ID,
+        CAST(Erfasst AS date)                     AS Datum,
+        CONVERT(char(5), Erfasst, 108)            AS Uhrzeit,
+        Bel_Nr                                    AS Fertigungsauftrag,
+        Fall_Nr, Bild_Nr,
+        Platinen_Nr, Artikelbezeichnung,
+        Fehlerart,
+        CONCAT_WS(N' - ', Bauteil_ArtikelNr, Bauteil_Bez) AS Bauteil,
+        Bauteil_ArtikelNr, Bauteil_Bez, Position, Gehaeuse, Technologie, Bauteiltyp,
+        Beschreibung, Vergroesserung, Bearbeiter, Arbeitsplatz,
+        Bildpfad, Dateiname, Erfasst
+FROM    {BEFUNDE_TABLE}
+WHERE   Geloescht = 0;{grant}
+"""
+
+
+def _write_conn(cfg, timeout=8):
+    return connect(cfg["server"], cfg["database"], cfg["user"], timeout=timeout, write=True)
+
+
+def table_exists(cfg):
+    with connect(cfg["server"], cfg["database"], cfg["user"]) as conn:
+        return conn.cursor().execute("SELECT OBJECT_ID(?, 'U')", BEFUNDE_TABLE).fetchone()[0] is not None
+
+
+def create_table(cfg):
+    """Legt die Tabelle an (braucht CREATE TABLE-Rechte für den angemeldeten Benutzer)."""
+    with _write_conn(cfg) as conn:
+        cur = conn.cursor()
+        for batch in re.split(r"^\s*GO\s*$", create_table_sql(), flags=re.M | re.I):
+            if batch.strip():
+                cur.execute(batch)
+        conn.commit()
+
+
+def insert_befund(cfg, data):
+    """Schreibt einen Befund, liefert die ID. Bereits vorhanden (gleicher Bildpfad) -> vorhandene ID."""
+    from datetime import datetime
+    values = []
+    for f in BEFUND_FIELDS:
+        v = data.get(f)
+        if f == "Erfasst" and isinstance(v, str):
+            v = datetime.fromisoformat(v)
+        if f == "Bild_Nr":
+            v = int(v) if v not in (None, "") else None
+        elif isinstance(v, str):
+            v = v.strip() or None
+        values.append(v)
+    cols = ", ".join(f"[{f}]" for f in BEFUND_FIELDS)
+    marks = ", ".join("?" for _ in BEFUND_FIELDS)
+    with _write_conn(cfg) as conn:
+        cur = conn.cursor()
+        try:
+            new_id = cur.execute(f"INSERT INTO {BEFUNDE_TABLE} ({cols}) OUTPUT INSERTED.ID VALUES ({marks})",
+                                 *values).fetchone()[0]
+            conn.commit()
+            return int(new_id)
+        except pyodbc.IntegrityError:          # schon eingetragen (z. B. Puffer erneut nachgetragen)
+            conn.rollback()
+            row = cur.execute(f"SELECT ID FROM {BEFUNDE_TABLE} WHERE Bildpfad = ?", data["Bildpfad"]).fetchone()
+            if row:
+                return int(row[0])
+            raise
+
+
+def mark_deleted(cfg, befund_id, user):
+    """Rückgängig: Eintrag als gelöscht markieren (bleibt zur Nachvollziehbarkeit in der Tabelle)."""
+    with _write_conn(cfg) as conn:
+        conn.cursor().execute(f"UPDATE {BEFUNDE_TABLE} SET Geloescht = 1, Geloescht_am = SYSDATETIME(), "
+                              f"Geloescht_von = ? WHERE ID = ?", user or None, int(befund_id))
+        conn.commit()
+
+
+BEFUND_COLUMNS = ["ID", "Erfasst"] + BEFUND_FIELDS[1:]
+
+
+def query_befunde(cfg, text="", fa="", fehlerart="", date_from=None, date_to=None, limit=1000):
+    """Befunde für die Listenansicht (neueste zuerst): ([dict, ...], Gesamtanzahl der Treffer)."""
+    where, params = ["Geloescht = 0"], []
+    if fa:
+        where.append("Bel_Nr LIKE ?")
+        params.append(fa.strip() + "%")
+    if fehlerart:
+        where.append("Fehlerart = ?")
+        params.append(fehlerart)
+    if date_from:
+        where.append("Erfasst >= ?")
+        params.append(date_from)
+    if date_to:
+        where.append("Erfasst < ?")
+        params.append(date_to)
+    if text:
+        like = "%" + re.sub(r"([\[%_])", r"[\1]", text.strip()) + "%"
+        cols = ["Bel_Nr", "Platinen_Nr", "Artikelbezeichnung", "Fehlerart", "Bauteil_ArtikelNr", "Bauteil_Bez",
+                "Position", "Beschreibung", "Bearbeiter", "Fall_Nr"]
+        where.append("(" + " OR ".join(f"{c} LIKE ?" for c in cols) + ")")
+        params += [like] * len(cols)
+    w = " AND ".join(where)
+    sel = ", ".join(f"[{c}]" for c in BEFUND_COLUMNS)
+    with connect(cfg["server"], cfg["database"], cfg["user"], timeout=10) as conn:
+        cur = conn.cursor()
+        total = cur.execute(f"SELECT COUNT(*) FROM {BEFUNDE_TABLE} WHERE {w}", *params).fetchone()[0]
+        rows = cur.execute(f"SELECT TOP {int(limit)} {sel} FROM {BEFUNDE_TABLE} WHERE {w} "
+                           f"ORDER BY Erfasst DESC, ID DESC", *params).fetchall()
+    return [dict(zip(BEFUND_COLUMNS, r)) for r in rows], int(total)
+
+
+def befunde_for_fa(cfg, fa):
+    """Alle Befunde eines Fertigungsauftrags (älteste zuerst) - für den PDF-Bericht."""
+    sel = ", ".join(f"[{c}]" for c in BEFUND_COLUMNS)
+    with connect(cfg["server"], cfg["database"], cfg["user"], timeout=10) as conn:
+        rows = conn.cursor().execute(f"SELECT {sel} FROM {BEFUNDE_TABLE} WHERE Geloescht = 0 AND Bel_Nr = ? "
+                                     f"ORDER BY Erfasst, ID", fa.strip()).fetchall()
+    return [dict(zip(BEFUND_COLUMNS, r)) for r in rows]
 
 
 def test_connection(server, database, user, password=None):

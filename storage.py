@@ -1,10 +1,11 @@
 """
 Ablage der Aufnahmen:
 - Bild in den Unterordner des Fertigungsauftrags  (…\Bilder Mikroskop\81678\…)
-- Eintrag in die gemeinsame Excel-Liste im Hauptordner
-- Offline-Puffer: Ist der Server nicht erreichbar oder Excel gesperrt, wird lokal
-  zwischengespeichert (%LOCALAPPDATA%\MikroskopCapture\puffer) und später nachgetragen.
-- Rückgängig, Befunde für den PDF-Bericht lesen, Log-Datei.
+- Vorschaubild in …\Bilder Mikroskop\.thumbs\ (für Programm-Ansichten)
+- Befund als Datensatz in die SQL-Tabelle dbo.SMD_Mikroskop_Befunde (ersetzt die frühere Excel-Liste)
+- Offline-Puffer: Ist der Server/die Datenbank nicht erreichbar, wird lokal zwischengespeichert
+  (%LOCALAPPDATA%\MikroskopCapture\puffer) und später automatisch nachgetragen.
+- Rückgängig (Bild -> .papierkorb, Datensatz als gelöscht markieren), Log-Datei.
 """
 
 import json
@@ -15,29 +16,13 @@ import re
 import threading
 import time
 import uuid
+from datetime import datetime
 from pathlib import Path
 
-try:
-    from openpyxl import Workbook, load_workbook
-    from openpyxl.drawing.image import Image as XLImage
-    from openpyxl.styles import Font, PatternFill, Alignment
-    from openpyxl.utils import get_column_letter
-except ImportError:
-    Workbook = None
+import sqldb
 
 log = logging.getLogger("mikroskop")
-
-# Excel-Spalten (Name, Breite). Vorhandene Listen werden anhand der Überschriften zugeordnet,
-# fehlende Spalten werden hinten angefügt.
-EXCEL_COLUMNS = [("Datum", 11), ("Uhrzeit", 9), ("Fertigungsauftrag (Bel_Nr)", 16), ("Fall-Nr.", 16),
-                 ("Bild-Nr.", 8), ("Platinen-Nr.", 22), ("Artikelbezeichnung", 26), ("Fehlerart", 22),
-                 ("Bauteil", 32), ("Position", 14), ("Gehäuse", 14), ("Technologie", 12), ("Bauteiltyp", 16),
-                 ("Schadensbeschreibung", 40), ("Vergrößerung", 14), ("Bearbeiter", 14), ("Dateiname", 44),
-                 ("Link", 11), ("Vorschau", 22)]
-RENAMED_COLUMNS = (("Serien-/Auftrags-Nr.", "Fertigungsauftrag (Bel_Nr)"),
-                   ("Leiterplatte / Artikel-Nr.", "Platinen-Nr."))
-THUMB_HEIGHT = 90
-FA_COLUMN = "Fertigungsauftrag (Bel_Nr)"
+THUMB_WIDTH = 480          # Vorschaubild (Liste "Befunde", Leiste "Letzte Aufnahmen")
 
 
 # ---------------- Hilfsfunktionen ----------------
@@ -93,55 +78,27 @@ def _hidden_subdir(root, name):
     return d
 
 
-# ---------------- Excel ----------------
-def open_sheet(xlsx):
-    """Öffnet/erstellt die Liste; liefert (wb, ws, {Überschrift: Spalte})."""
-    if Workbook is None:
-        raise RuntimeError("openpyxl ist nicht installiert (pip install openpyxl)")
-    if xlsx.exists():
-        wb = load_workbook(xlsx)
-        ws = wb.active
-    else:
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "Schäden"
-        ws.freeze_panes = "A2"
-    cols = {c.value: c.column for c in ws[1] if c.value}
-    for old, new in RENAMED_COLUMNS:            # ältere Listen umbenennen
-        if old in cols and new not in cols:
-            col = cols.pop(old)
-            ws.cell(row=1, column=col, value=new)
-            cols[new] = col
-    for name, width in EXCEL_COLUMNS:
-        if name not in cols:
-            col = max(cols.values(), default=0) + 1
-            cell = ws.cell(row=1, column=col, value=name)
-            cell.font = Font(bold=True, color="FFFFFF")
-            cell.fill = PatternFill("solid", fgColor="305496")
-            ws.column_dimensions[get_column_letter(col)].width = width
-            cols[name] = col
-    return wb, ws, cols
+def thumb_path(image_path):
+    """Vorschaubild zu einem Foto: <Hauptordner>\\.thumbs\\<Name>.jpg (Hauptordner = über dem FA-Ordner)."""
+    p = Path(image_path)
+    for root in (p.parent.parent, p.parent):
+        t = root / ".thumbs" / (p.stem + ".jpg")
+        if t.exists():
+            return t
+    return None
 
 
-def place_thumbs(ws, cols, thumb_dir):
-    # openpyxl verliert beim Laden vorhandene Bilder -> alle Vorschaubilder neu einfügen
-    ws._images = []
-    if not thumb_dir.is_dir():
-        return
-    name_col, thumb_col = cols["Dateiname"], get_column_letter(cols["Vorschau"])
-    for row in range(2, ws.max_row + 2):
-        name = ws.cell(row=row, column=name_col).value
-        t = thumb_dir / (Path(str(name)).stem + ".jpg") if name else None
-        if t and t.exists():
-            ws.add_image(XLImage(str(t)), f"{thumb_col}{row}")
-            ws.row_dimensions[row].height = THUMB_HEIGHT * 0.78
-        elif row in ws.row_dimensions:
-            ws.row_dimensions[row].height = None
+def _short_err(e):
+    msg = str(e)
+    m = re.search(r"\]([^\[\]]+)\(\d+\)", msg)          # ODBC-Meldung kürzen
+    return (m.group(1).strip() if m else msg)[:300]
 
 
 class Store:
-    """rec (Aufnahme-Datensatz): id, root, fa_folder, filename, excel_name (None = kein Excel),
-    values (Excel-Spalten), created"""
+    """
+    rec (Aufnahme-Datensatz): id, root, fa_folder, filename, sql (Server/DB/Benutzer, ohne Passwort),
+    data (Spalten für dbo.SMD_Mikroskop_Befunde), db_id (nach dem Eintragen), stage (im Puffer)
+    """
 
     def __init__(self, on_change=None):
         self.lock = threading.RLock()
@@ -155,34 +112,32 @@ class Store:
         return Path(rec["root"]) / rec["fa_folder"] / rec["filename"]
 
     @staticmethod
-    def new_record(root, fa, filename, excel_name, values):
+    def new_record(root, fa, filename, sql_cfg, data):
         return {"id": uuid.uuid4().hex, "root": str(root), "fa_folder": fa_folder(fa), "filename": filename,
-                "excel_name": excel_name, "values": values, "created": time.time()}
+                "sql": {k: sql_cfg.get(k, "") for k in ("server", "database", "user")},
+                "data": data, "db_id": None, "created": time.time()}
 
     # ---- Speichern ----
     def save(self, rec, img_bytes, thumb_bytes):
-        """Speichert Bild + Excel-Eintrag. Ergebnis: ("ok"|"excel_buffered"|"buffered", Grund)."""
+        """Speichert Bild + Datensatz. Ergebnis: ("ok"|"db_buffered"|"buffered", Grund)."""
         with self.lock:
             try:
-                self._write_image(rec, img_bytes)
+                self._write_image(rec, img_bytes, thumb_bytes)
             except Exception as e:
                 log.warning("Bild nicht speicherbar (%s) -> Puffer: %s", e, rec["filename"])
                 self._buffer(rec, "image", img_bytes, thumb_bytes)
                 return "buffered", str(e)
             log.info("Bild gespeichert: %s", self.image_path(rec))
-            if not rec["excel_name"]:
-                return "ok", None
             try:
-                self._excel_append(rec, thumb_bytes)
+                self._db_insert(rec)
             except Exception as e:
-                reason = "Excel-Liste ist geöffnet/gesperrt" if isinstance(e, PermissionError) else str(e)
-                log.warning("Excel-Eintrag nicht möglich (%s) -> Puffer: %s", reason, rec["filename"])
-                self._buffer(rec, "excel", None, thumb_bytes)
-                return "excel_buffered", reason
-            log.info("Excel-Eintrag: %s", rec["values"].get("Dateiname"))
+                reason = _short_err(e)
+                log.warning("Datenbank-Eintrag nicht möglich (%s) -> Puffer: %s", reason, rec["filename"])
+                self._buffer(rec, "db", None, None)
+                return "db_buffered", reason
             return "ok", None
 
-    def _write_image(self, rec, img_bytes):
+    def _write_image(self, rec, img_bytes, thumb_bytes):
         d = Path(rec["root"]) / rec["fa_folder"]
         d.mkdir(parents=True, exist_ok=True)
         base, ext = os.path.splitext(rec["filename"])
@@ -192,25 +147,18 @@ class Store:
             n += 1
         path.write_bytes(img_bytes)              # funktioniert auch mit Umlauten / UNC-Pfaden
         rec["filename"] = path.name
-        rec["values"]["Dateiname"] = path.name
-
-    def _excel_append(self, rec, thumb_bytes):
-        root = Path(rec["root"])
-        xlsx = root / rec["excel_name"]
+        rec["data"]["Dateiname"] = path.name
+        rec["data"]["Bildpfad"] = str(path)
         if thumb_bytes:
-            (_hidden_subdir(root, ".thumbs") / (Path(rec["filename"]).stem + ".jpg")).write_bytes(thumb_bytes)
-        wb, ws, cols = open_sheet(xlsx)
-        r = ws.max_row + 1
-        for name, v in rec["values"].items():
-            if name in cols:
-                cell = ws.cell(row=r, column=cols[name], value=v)
-                cell.alignment = Alignment(vertical="top", wrap_text=(name == "Schadensbeschreibung"))
-        link = ws.cell(row=r, column=cols["Link"], value="Bild öffnen")
-        link.hyperlink = str(self.image_path(rec))
-        link.font = Font(color="0563C1", underline="single")
-        link.alignment = Alignment(vertical="top")
-        place_thumbs(ws, cols, root / ".thumbs")
-        wb.save(xlsx)
+            try:
+                (_hidden_subdir(rec["root"], ".thumbs") / (path.stem + ".jpg")).write_bytes(thumb_bytes)
+            except OSError as e:
+                log.warning("Vorschaubild nicht speicherbar: %s", e)
+
+    def _db_insert(self, rec):
+        rec["db_id"] = sqldb.insert_befund(rec["sql"], rec["data"])
+        log.info("Datenbank: Befund %s eingetragen (FA %s, %s)", rec["db_id"], rec["data"].get("Bel_Nr"),
+                 rec["filename"])
 
     # ---- Offline-Puffer ----
     def _buffer(self, rec, stage, img_bytes, thumb_bytes):
@@ -220,7 +168,8 @@ class Store:
             (b / f"{rec['id']}.img").write_bytes(img_bytes)
         if thumb_bytes:
             (b / f"{rec['id']}.thumb").write_bytes(thumb_bytes)
-        (b / f"{rec['id']}.json").write_text(json.dumps(rec, ensure_ascii=False, indent=1), encoding="utf-8")
+        (b / f"{rec['id']}.json").write_text(json.dumps(rec, ensure_ascii=False, indent=1, default=str),
+                                             encoding="utf-8")
         self.on_change(self.pending_count())
 
     def pending_count(self):
@@ -228,10 +177,6 @@ class Store:
 
     def is_buffered(self, rec):
         return (self.buffer_dir / f"{rec['id']}.json").exists()
-
-    def buffered_image(self, rec):
-        p = self.buffer_dir / f"{rec['id']}.img"
-        return p if p.exists() else None
 
     def _drop(self, rid):
         for ext in ("json", "img", "thumb"):
@@ -245,41 +190,41 @@ class Store:
                 try:
                     rec = json.loads(j.read_text(encoding="utf-8"))
                     rid = rec["id"]
-                    thumb = self.buffer_dir / f"{rid}.thumb"
-                    thumb_bytes = thumb.read_bytes() if thumb.exists() else None
+                    if "data" not in rec:              # Eintrag aus der früheren Excel-Version -> verwerfen
+                        log.warning("Puffer: alter Excel-Eintrag übersprungen: %s", rec.get("filename"))
+                        self._drop(rid)
+                        continue
                     if rec.get("stage") == "image":
-                        self._write_image(rec, (self.buffer_dir / f"{rid}.img").read_bytes())
-                        rec["stage"] = "excel"
-                        j.write_text(json.dumps(rec, ensure_ascii=False, indent=1), encoding="utf-8")
+                        thumb = self.buffer_dir / f"{rid}.thumb"
+                        self._write_image(rec, (self.buffer_dir / f"{rid}.img").read_bytes(),
+                                          thumb.read_bytes() if thumb.exists() else None)
+                        rec["stage"] = "db"
+                        j.write_text(json.dumps(rec, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
                         (self.buffer_dir / f"{rid}.img").unlink(missing_ok=True)
                         log.info("Puffer: Bild nachgetragen: %s", self.image_path(rec))
-                    if rec.get("excel_name"):
-                        self._excel_append(rec, thumb_bytes)
-                        log.info("Puffer: Excel-Eintrag nachgetragen: %s", rec["filename"])
+                    self._db_insert(rec)
                     self._drop(rid)
                     done += 1
                 except Exception as e:
-                    err = "Excel-Liste ist geöffnet/gesperrt" if isinstance(e, PermissionError) else str(e)
+                    err = _short_err(e)
                     log.info("Puffer: Nachtragen noch nicht möglich (%s)", err)
-                    break          # Server/Excel noch nicht bereit -> später erneut
+                    break          # Server/Datenbank noch nicht bereit -> später erneut
         n = self.pending_count()
         if done:
             self.on_change(n)
         return done, n, err
 
     # ---- Rückgängig ----
-    def undo(self, rec):
-        """Entfernt eine Aufnahme (Bild -> .papierkorb, Excel-Zeile löschen). Liefert Warntext oder None."""
+    def undo(self, rec, user=""):
+        """Bild -> .papierkorb, Datensatz als gelöscht markieren. Liefert Warntext oder None."""
         with self.lock:
-            if self.is_buffered(rec) and rec.get("stage", "image") == "image":
+            if self.is_buffered(rec):
+                stage = rec.get("stage", "image")
                 self._drop(rec["id"])
                 self.on_change(self.pending_count())
-                log.info("Rückgängig (aus Puffer): %s", rec["filename"])
-                return None
-            excel_pending = self.is_buffered(rec)
-            if excel_pending:
-                self._drop(rec["id"])
-                self.on_change(self.pending_count())
+                if stage == "image":
+                    log.info("Rückgängig (aus Puffer): %s", rec["filename"])
+                    return None
             warn = None
             root, path = Path(rec["root"]), self.image_path(rec)
             try:
@@ -288,50 +233,34 @@ class Store:
                 (root / ".thumbs" / (path.stem + ".jpg")).unlink(missing_ok=True)
             except Exception as e:
                 warn = f"Bild konnte nicht entfernt werden: {e}"
-            if rec["excel_name"] and not excel_pending:
+            if rec.get("db_id"):
                 try:
-                    self.remove_excel_row(root / rec["excel_name"], rec["filename"])
-                except PermissionError:
-                    warn = "Excel-Liste ist geöffnet – Zeile bitte von Hand löschen."
+                    sqldb.mark_deleted(rec["sql"], rec["db_id"], user)
                 except Exception as e:
-                    warn = f"Excel-Zeile konnte nicht entfernt werden: {e}"
-            log.info("Rückgängig: %s%s", rec["filename"], f" (Warnung: {warn})" if warn else "")
+                    warn = f"Datenbank-Eintrag {rec['db_id']} konnte nicht als gelöscht markiert werden: {_short_err(e)}"
+            log.info("Rückgängig: %s (DB-ID %s)%s", rec["filename"], rec.get("db_id"),
+                     f" – Warnung: {warn}" if warn else "")
             return warn
 
-    def remove_excel_row(self, xlsx, filename):
-        wb, ws, cols = open_sheet(xlsx)
-        for row in range(ws.max_row, 1, -1):
-            if ws.cell(row=row, column=cols["Dateiname"]).value == filename:
-                ws.delete_rows(row)
-                break
-        place_thumbs(ws, cols, xlsx.parent / ".thumbs")
-        wb.save(xlsx)
 
-    # ---- Befunde eines Auftrags (für den PDF-Bericht) ----
-    def findings(self, root, excel_name, fa):
-        """Alle Excel-Zeilen zum Fertigungsauftrag als dicts (+ "_image": Pfad zum Bild oder None)."""
-        root = Path(root)
-        xlsx = root / excel_name
-        if not xlsx.exists():
-            return []
-        wb = load_workbook(xlsx, read_only=True)
-        ws = wb.active
-        rows = ws.iter_rows(values_only=True)
-        header = [str(h) if h is not None else "" for h in next(rows, [])]
-        for old, new in RENAMED_COLUMNS:
-            header = [new if h == old else h for h in header]
-        out = []
-        for r in rows:
-            d = {h: ("" if v is None else v) for h, v in zip(header, r) if h}
-            if str(d.get(FA_COLUMN, "")).strip() != str(fa).strip():
-                continue
-            name = str(d.get("Dateiname", ""))
-            img = None
-            for cand in (root / fa_folder(fa) / name, root / name):
-                if name and cand.exists():
-                    img = cand
-                    break
-            d["_image"] = img
-            out.append(d)
-        wb.close()
-        return out
+# ---------------- Befunde für den PDF-Bericht ----------------
+def findings_from_db(sql_cfg, fa):
+    """Befunde eines Fertigungsauftrags aus der Datenbank, im Format für report.make_report."""
+    out = []
+    for r in sqldb.befunde_for_fa(sql_cfg, fa):
+        erf = r.get("Erfasst")
+        bauteil = "  ·  ".join(x for x in (r.get("Bauteil_ArtikelNr") or "", r.get("Bauteil_Bez") or "") if x)
+        img = Path(r["Bildpfad"]) if r.get("Bildpfad") else None
+        out.append({
+            "Datum": erf.strftime("%d.%m.%Y") if isinstance(erf, datetime) else "",
+            "Uhrzeit": erf.strftime("%H:%M:%S") if isinstance(erf, datetime) else "",
+            "Fall-Nr.": r.get("Fall_Nr") or "", "Bild-Nr.": r.get("Bild_Nr") or "",
+            "Platinen-Nr.": r.get("Platinen_Nr") or "", "Artikelbezeichnung": r.get("Artikelbezeichnung") or "",
+            "Fehlerart": r.get("Fehlerart") or "", "Bauteil": bauteil, "Position": r.get("Position") or "",
+            "Gehäuse": r.get("Gehaeuse") or "", "Technologie": r.get("Technologie") or "",
+            "Bauteiltyp": r.get("Bauteiltyp") or "", "Schadensbeschreibung": r.get("Beschreibung") or "",
+            "Vergrößerung": r.get("Vergroesserung") or "", "Bearbeiter": r.get("Bearbeiter") or "",
+            "Dateiname": r.get("Dateiname") or "",
+            "_image": img if img and img.exists() else None,
+        })
+    return out

@@ -3,9 +3,6 @@
   "camera_name": "eMeet Nova",
   "resolution": "3840x2160",
   "save_dir": "C:\\Users\\t.breitling\\Pictures\\Camera Roll",
-  "excel_name": "Schadensdokumentation.xlsx",
-  "excel_enabled": true,
-  "excel_thumbnail": true,
   "image_format": "png",
   "bearbeiter": "t.breitling",
   "appearance": "Dark",
@@ -30,7 +27,7 @@
   "overlay_info": true,
   "overlay_scale": true,
   "crosshair": false,
-  "live_scale": false,
+  "live_scale": true,
   "server_user": "se-elektronic.local\\smd",
   "server_drive": "N:",
   "sql": {
@@ -48,5 +45,8 @@
       1.0
     ]
   },
+  "excel_name": "Schadensdokumentation.xlsx",
+  "excel_enabled": true,
+  "excel_thumbnail": true,
   "hersteller_history": []
 }

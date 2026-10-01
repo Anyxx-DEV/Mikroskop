@@ -194,6 +194,19 @@ def _database(p):
         p.d.arc([5 * p.k, (y - 2.5) * p.k, 19 * p.k, (y + 2.5) * p.k], 0, 180, fill=p.c, width=p.w)
 
 
+def _table(p):
+    p.rect(3, 4.5, 21, 19.5, 2)
+    p.line((3, 9.5), (21, 9.5))
+    p.line((3, 14.5), (21, 14.5))
+    p.line((9, 9.5), (9, 19.5))
+
+
+def _download(p):
+    p.line((12, 3.5), (12, 15))
+    p.line((7.5, 10.5), (12, 15), (16.5, 10.5))
+    p.line((4, 16.5), (4, 20), (20, 20), (20, 16.5))
+
+
 def _chevron_down(p):
     p.line((6, 9.5), (12, 15.5), (18, 9.5))
 
@@ -287,7 +300,7 @@ _ICONS = {
     "zoom_in": _zoom_in, "zoom_out": _zoom_out, "crosshair": _crosshair, "ruler": _ruler,
     "fullscreen": _fullscreen, "help": _help, "arrow": _arrow, "circle": _circle, "square": _square,
     "text": _text, "undo": _undo, "trash": _trash, "plus": _plus, "x": _x, "tag": _tag,
-    "search": _search, "database": _database, "chevron_down": _chevron_down, "chevron_right": _chevron_right,
+    "search": _search, "database": _database, "table": _table, "download": _download, "chevron_down": _chevron_down, "chevron_right": _chevron_right,
 }
 
 

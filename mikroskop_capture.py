@@ -4,7 +4,7 @@ Mikroskop-Capture
 Live-Bild von der Capture-Card (Vision Engineering Makrolite 4K via HDMI),
 Aufnahme per Button / Taste (F9, Leertaste oder Contour Shuttle Pro V2),
 Markieren, Messen, Info-Leiste und Maßstab im Foto, Speichern im Serverordner
-und Eintrag in eine Excel-Liste.
+und Eintrag in die SQL-Tabelle dbo.SMD_Mikroskop_Befunde (Ansicht im Fenster "Befunde").
 """
 
 import json
@@ -80,9 +80,6 @@ DEFAULT_CONFIG = {
     "camera_name": "",
     "resolution": "3840x2160",
     "save_dir": SERVER_DIR,
-    "excel_name": "Schadensdokumentation.xlsx",
-    "excel_enabled": True,
-    "excel_thumbnail": True,
     "image_format": "png",
     "bearbeiter": os.environ.get("USERNAME", ""),
     "appearance": "Dark",
@@ -257,6 +254,7 @@ class App:
         self.check_server()
         self._update_buffer_badge(self.store.pending_count())
         self.root.after(2000, self.load_global_bauteile)     # Bauteil-Suche über alle Stücklisten vorbereiten
+        self.root.after(2500, self.check_befunde_table)      # gibt es die Befunde-Tabelle schon?
         self.root.after(RETRY_MS, self._retry_timer)
         root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.update_preview()
@@ -300,6 +298,7 @@ class App:
         self.theme_btn.pack(side="right")
         self._update_theme_button()
         button(header, " Tasten", self.show_help, icon="help", kind="ghost", width=100).pack(side="right", padx=(0, 8))
+        button(header, " Befunde", self.open_befunde, icon="table", width=120).pack(side="right", padx=(0, 8))
         self.count_label = ctk.CTkLabel(header, text="  0 Aufnahmen", image=ctk_icon("camera", 16, MUTED),
                                         compound="left", fg_color=SECONDARY, corner_radius=16, height=32,
                                         text_color=FG, font=F(12, "bold"), padx=12)
@@ -679,7 +678,7 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def _build_storage_card(self, side):
-        card = Card(side, "Speicherort", "folder", collapsible=True, collapsed=True, hint="Server, Excel, Log")
+        card = Card(side, "Speicherort", "folder", collapsible=True, collapsed=True, hint="Bilder-Ordner, Log")
         card.pack(fill="x", pady=(0, 10))
         b = card.body
         field_label(b, "Zielordner")
@@ -707,15 +706,9 @@ class App:
         self.fmt_seg.set(self.cfg["image_format"].upper())
         self.fmt_seg.pack(side="right")
 
-        self.excel_var = tk.BooleanVar(value=self.cfg["excel_enabled"])
-        self.thumb_var = tk.BooleanVar(value=self.cfg["excel_thumbnail"])
-        switch(b, "In Excel-Liste eintragen", self.excel_var).pack(anchor="w", pady=(16, 0))
-        switch(b, "Vorschaubild in Excel einfügen", self.thumb_var).pack(anchor="w", pady=(10, 0))
-        field_label(b, "Excel-Datei")
-        self.excel_name_var = tk.StringVar(value=self.cfg["excel_name"])
-        entry(b, self.excel_name_var).pack(fill="x")
         ctk.CTkLabel(b, text="Bilder werden je Fertigungsauftrag in einem Unterordner abgelegt "
-                             "(z. B. …\\81678\\). Die Excel-Liste liegt im Hauptordner.",
+                             "(z. B. …\\81678\\). Die Angaben stehen in der Datenbank "
+                             "(Tabelle SMD_Mikroskop_Befunde) – Ansicht über „Befunde“ oben.",
                      text_color=MUTED, font=F(11), anchor="w", justify="left", wraplength=340).pack(fill="x", pady=(8, 0))
         button(b, " Log-Datei öffnen", self.open_log, icon="clipboard", kind="ghost").pack(fill="x", pady=(10, 0))
 
@@ -745,6 +738,87 @@ class App:
         self.sql_info.pack(fill="x", pady=(8, 0))
         button(b, " Verbindung einrichten & testen", self.setup_sql, icon="database").pack(fill="x", pady=(8, 0))
         self._update_sql_info()
+
+        # Befunde-Tabelle (ersetzt die Excel-Liste)
+        field_label(b, "Tabelle für die Befunde")
+        self.table_info = ctk.CTkLabel(b, text="Noch nicht geprüft.", text_color=MUTED, font=F(12), anchor="w",
+                                       justify="left", wraplength=340)
+        self.table_info.pack(fill="x")
+        row = ctk.CTkFrame(b, fg_color="transparent")
+        row.pack(fill="x", pady=(8, 0))
+        row.grid_columnconfigure((0, 1), weight=1, uniform="c")
+        button(row, " Prüfen / anlegen", self.create_befunde_table, icon="plus").grid(
+            row=0, column=0, sticky="ew", padx=(0, 4))
+        button(row, " SQL-Skript", self.open_sql_script, icon="clipboard", kind="ghost").grid(
+            row=0, column=1, sticky="ew", padx=(4, 0))
+
+    def open_sql_script(self):
+        p = APP_DIR / "sql" / "Befunde_Tabelle.sql"
+        if not p.exists():
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text("USE [SE_Tools];\nGO\n" + sqldb.create_table_sql(self._sql_cfg().get("user", "")),
+                         encoding="utf-8-sig")
+        os.startfile(p.parent)
+
+    def check_befunde_table(self):
+        """Prüft im Hintergrund, ob die Tabelle dbo.SMD_Mikroskop_Befunde existiert."""
+        if not self._sql_ready() or not sqldb.has_password(self._sql_cfg()["server"]):
+            return
+        cfg = dict(self._sql_cfg())
+
+        def work():
+            try:
+                ok, err = sqldb.table_exists(cfg), None
+            except Exception as e:
+                ok, err = None, storage._short_err(e)
+            self.root.after(0, lambda: self._table_status(ok, err))
+
+        threading.Thread(target=work, daemon=True).start()
+
+    def _table_status(self, ok, err):
+        self._table_ok = ok
+        if ok:
+            self.table_info.configure(text="✓ Tabelle SMD_Mikroskop_Befunde ist vorhanden.", text_color=OK_GREEN)
+        elif ok is False:
+            log.warning("Tabelle %s fehlt in der Datenbank", sqldb.BEFUNDE_TABLE)
+            self.table_info.configure(
+                text="Tabelle SMD_Mikroskop_Befunde fehlt – Befunde werden so lange im Puffer gesammelt. "
+                     "„Prüfen / anlegen“ klicken oder das SQL-Skript im Management Studio ausführen.", text_color=ERR)
+            self.set_status("Datenbank-Tabelle für die Befunde fehlt – Reiter „Einstellungen“ → „Datenbank“.", WARN)
+        else:
+            self.table_info.configure(text=f"Prüfung nicht möglich: {err}", text_color=WARN)
+
+    def create_befunde_table(self):
+        """Prüft die Tabelle und legt sie nach Rückfrage an (braucht CREATE TABLE-Rechte)."""
+        if not self._sql_ready():
+            self.table_info.configure(text="Bitte zuerst die Verbindung einrichten.", text_color=ERR)
+            return
+        cfg = dict(self._sql_cfg())
+        try:
+            exists = sqldb.table_exists(cfg)
+        except Exception as e:
+            self.table_info.configure(text=f"Prüfung nicht möglich: {storage._short_err(e)}", text_color=ERR)
+            return
+        if exists:
+            self._table_status(True, None)
+            return
+        if not messagebox.askyesno(
+                APP_NAME, f"Die Tabelle {sqldb.BEFUNDE_TABLE} gibt es noch nicht.\n\nJetzt in der Datenbank "
+                          f"„{cfg['database']}“ auf {cfg['server']} anlegen (als Benutzer „{cfg['user']}“)?\n\n"
+                          "Dafür sind CREATE TABLE-Rechte nötig. Alternativ das SQL-Skript im Management Studio "
+                          "ausführen."):
+            return
+        try:
+            sqldb.create_table(cfg)
+            log.info("Tabelle %s angelegt (Benutzer %s)", sqldb.BEFUNDE_TABLE, cfg["user"])
+            self._table_status(True, None)
+            self.toast("Datenbank-Tabelle angelegt", OK_GREEN)
+            self.retry_buffer()
+        except Exception as e:
+            err = storage._short_err(e)
+            log.error("Tabelle anlegen fehlgeschlagen: %s", err)
+            self.table_info.configure(text=f"Anlegen nicht möglich: {err}\n→ Das SQL-Skript im Management Studio "
+                                           f"ausführen (Button „SQL-Skript“).", text_color=ERR)
 
     def _save_sql_fields(self):
         self.cfg["sql"] = {k: v.get().strip() for k, v in self.sql_vars.items()}
@@ -782,11 +856,24 @@ class App:
                 n = sqldb.test_connection(c["server"], c["database"], c["user"], pw)
                 sqldb.store_password(c["server"], c["user"], pw)
                 res = (f"✓ Verbunden – {n} Einträge in SMD_FA_Fehler. Passwort in Windows gespeichert.", OK_GREEN)
+                ok = True
             except Exception as e:
                 res = (f"Verbindung fehlgeschlagen: {e}", ERR)
-            self.root.after(0, lambda: self._update_sql_info(*res))
+                ok = False
+            self.root.after(0, lambda: (self._update_sql_info(*res), ok and self.check_befunde_table()))
 
         threading.Thread(target=work, daemon=True).start()
+
+    def open_befunde(self):
+        """Fenster mit allen Befunden aus der Datenbank (wie eine Excel-Liste)."""
+        win = getattr(self, "_befunde_win", None)
+        if win is not None and win.winfo_exists():
+            win.lift()
+            win.focus_force()
+            win.reload()
+            return
+        from viewer import BefundeWindow
+        self._befunde_win = BefundeWindow(self, fa="")
 
     def show_tab(self, name):
         self.tab_seg.set(name)
@@ -2017,9 +2104,6 @@ class App:
             resolution=self.res_menu.get(),
             video_mode=self.mode_menu.get(),
             save_dir=self.dir_var.get(),
-            excel_name=self.excel_name_var.get().strip() or DEFAULT_CONFIG["excel_name"],
-            excel_enabled=self.excel_var.get(),
-            excel_thumbnail=self.thumb_var.get(),
             image_format=self.fmt_seg.get().lower(),
             bearbeiter=self.bearbeiter_var.get(),
             annotate_after=self.annotate_var.get(),
@@ -2099,12 +2183,11 @@ class App:
             log.error("Bild konnte nicht kodiert werden")
             messagebox.showerror(APP_NAME, "Bild konnte nicht kodiert werden.")
             return
-        thumb = None
-        if self.excel_var.get() and self.thumb_var.get():
-            h, w = img.shape[:2]
-            th = storage.THUMB_HEIGHT
-            thumb = cv2.imencode(".jpg", cv2.resize(img, (int(w * th / h), th), interpolation=cv2.INTER_AREA),
-                                 [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tobytes()
+        # Vorschaubild für die Ansichten im Programm (Liste "Befunde", Leiste "Letzte Aufnahmen")
+        h, w = img.shape[:2]
+        tw = storage.THUMB_WIDTH
+        thumb = cv2.imencode(".jpg", cv2.resize(img, (tw, int(h * tw / w)), interpolation=cv2.INTER_AREA),
+                             [cv2.IMWRITE_JPEG_QUALITY, 85])[1].tobytes()
 
         parts = [now.strftime("%Y-%m-%d_%H-%M-%S")]
         for v in (f"FA{fa}" if fa else "", self.artikel_var.get()):
@@ -2112,26 +2195,23 @@ class App:
                 parts.append(safe_name(v))
         filename = "_".join(parts) + f".{ext}"
         det = self.bauteil_details()
+        bauteil = self.bauteil_var.get().strip()
         cal = self.cfg.get("calibration") if self.active_ppm(1) else ""
-        values = {
-            "Datum": now.strftime("%d.%m.%Y"), "Uhrzeit": now.strftime("%H:%M:%S"),
-            "Fertigungsauftrag (Bel_Nr)": fa,
-            "Fall-Nr.": self.case_id, "Bild-Nr.": img_no,
-            "Platinen-Nr.": self.artikel_var.get().strip(),
+        data = {   # Spalten der Tabelle dbo.SMD_Mikroskop_Befunde
+            "Erfasst": now.replace(microsecond=0).isoformat(), "Bel_Nr": fa,
+            "Fall_Nr": self.case_id, "Bild_Nr": img_no,
+            "Platinen_Nr": self.artikel_var.get().strip(),
             "Artikelbezeichnung": self.artikeltext_var.get().strip(),
             "Fehlerart": self.fehlerart(),
-            "Bauteil": self.bauteil_var.get().strip(),
-            "Position": det.get("pos", ""),
-            "Gehäuse": det.get("package", ""), "Technologie": det.get("technology", ""),
-            "Bauteiltyp": det.get("type", ""),
-            "Schadensbeschreibung": self.desc_text.get("1.0", "end").strip(),
-            "Vergrößerung": cal,
-            "Bearbeiter": self.bearbeiter_var.get().strip(),
-            "Dateiname": filename,
+            "Bauteil_ArtikelNr": det.get("artnr", ""),
+            "Bauteil_Bez": det.get("bez", "") if det else bauteil,      # frei eingetippt -> als Text
+            "Position": det.get("pos", ""), "Gehaeuse": det.get("package", ""),
+            "Technologie": det.get("technology", ""), "Bauteiltyp": det.get("type", ""),
+            "Beschreibung": self.desc_text.get("1.0", "end").strip(),
+            "Vergroesserung": cal, "Bearbeiter": self.bearbeiter_var.get().strip(),
+            "Bildpfad": "", "Dateiname": filename, "Arbeitsplatz": os.environ.get("COMPUTERNAME", ""),
         }
-        excel_name = (self.excel_name_var.get().strip() or DEFAULT_CONFIG["excel_name"]) \
-            if self.excel_var.get() else None
-        rec = storage.Store.new_record(self.dir_var.get().strip(), fa, filename, excel_name, values)
+        rec = storage.Store.new_record(self.dir_var.get().strip(), fa, filename, self._sql_cfg(), data)
         state, reason = self.store.save(rec, buf.tobytes(), thumb)
 
         self.case_img = img_no
@@ -2143,13 +2223,13 @@ class App:
         path = self.store.image_path(rec)
         marks = f"  ·  {len(shapes)} Markierung{'en' if len(shapes) != 1 else ''}" if shapes else ""
         if state == "ok":
-            msg = f"Gespeichert: {rec['fa_folder']}\\{rec['filename']}" + ("   ·   Excel aktualisiert" if excel_name else "")
-            self.set_status(msg + "   ·   F8 = rückgängig", OK_GREEN)
-            self.toast(f"Bild {img_no} gespeichert{marks}" + ("  ·  Excel aktualisiert" if excel_name else ""))
-        elif state == "excel_buffered":
-            self.set_status(f"Bild gespeichert, Excel-Eintrag im Puffer ({reason}) – wird automatisch nachgetragen.",
-                            WARN)
-            self.toast(f"Bild {img_no} gespeichert  ·  Excel wird nachgetragen", WARN, ok=False)
+            self.set_status(f"Gespeichert: {rec['fa_folder']}\\{rec['filename']}   ·   Datenbank-Eintrag "
+                            f"{rec['db_id']}   ·   F8 = rückgängig", OK_GREEN)
+            self.toast(f"Bild {img_no} gespeichert{marks}  ·  in Datenbank eingetragen")
+        elif state == "db_buffered":
+            self.set_status(f"Bild gespeichert, Datenbank-Eintrag im Puffer ({reason}) – wird automatisch "
+                            f"nachgetragen.", WARN)
+            self.toast(f"Bild {img_no} gespeichert  ·  Datenbank wird nachgetragen", WARN, ok=False)
         else:
             self.set_status(f"Server nicht erreichbar – Bild lokal zwischengespeichert, wird automatisch "
                             f"nachgetragen. ({reason})", WARN)
@@ -2173,7 +2253,7 @@ class App:
         item = self.undo_stack.pop()
         rec = item["rec"]
         path = self.store.image_path(rec)
-        warn = self.store.undo(rec)
+        warn = self.store.undo(rec, self.bearbeiter_var.get().strip() or os.environ.get("USERNAME", ""))
         if item["case_id"] == self.case_id and self.case_img > 0:
             self.case_img -= 1
             self._update_case_label()
@@ -2188,22 +2268,23 @@ class App:
             self.toast("Letzte Aufnahme rückgängig gemacht", OK_GREEN)
 
     # ================= PDF-Bericht =================
-    def make_pdf_report(self):
-        fa = self.fa_var.get().strip()
+    def make_pdf_report(self, fa=None, on_done=None):
+        fa = (fa or self.fa_var.get()).strip()
         if not fa:
             self._fa_error("Für den Bericht bitte den Fertigungsauftrag eingeben")
             return
         root_dir = Path(self.dir_var.get().strip())
-        excel_name = self.excel_name_var.get().strip() or DEFAULT_CONFIG["excel_name"]
+        sql_cfg = dict(self._sql_cfg())
         author = self.bearbeiter_var.get().strip()
         self.set_status(f"Erstelle PDF-Bericht für FA {fa}…")
         pending = self.store.pending_count()
+        self._pdf_callback = on_done
 
         def work():
             try:
-                findings = self.store.findings(root_dir, excel_name, fa)
+                findings = storage.findings_from_db(sql_cfg, fa)
                 if not findings:
-                    raise LookupError(f"Zu FA {fa} gibt es noch keine Einträge in der Excel-Liste.")
+                    raise LookupError(f"Zu FA {fa} gibt es noch keine Befunde in der Datenbank.")
                 name = f"Schadensbericht_FA{storage.fa_folder(fa)}_{datetime.now():%Y-%m-%d_%H-%M}.pdf"
                 out = root_dir / storage.fa_folder(fa) / name
                 try:
@@ -2223,6 +2304,9 @@ class App:
         threading.Thread(target=work, daemon=True).start()
 
     def _pdf_done(self, fa, pending, ok, result, count):
+        cb, self._pdf_callback = getattr(self, "_pdf_callback", None), None
+        if cb:
+            cb(ok, result)
         if not ok:
             self.set_status(f"PDF-Bericht: {result}", ERR)
             self.toast("PDF-Bericht nicht möglich", ERR, ok=False)
