@@ -1064,13 +1064,15 @@ class App:
         if not text or not self._sql_ready():
             self.fa_suggest.hide()
             return
+        self._fa_error(None)
         self._suggest_seq += 1
         seq, cfg = self._suggest_seq, dict(self._sql_cfg())
 
         def work():
             try:
                 rows = sqldb.suggest_auftraege(cfg, text)
-            except Exception:
+            except Exception as e:
+                log.warning("Vorschläge Fertigungsauftrag '%s': %s", text, storage._short_err(e))
                 rows = None     # Fehler zeigt spätestens die normale Suche (Enter) an
             self.root.after(0, lambda: self._show_suggest(seq, text, rows))
 
@@ -1085,10 +1087,16 @@ class App:
         if len(rows) == 1 and rows[0][0] == text and self.artikel_var.get().strip() == rows[0][1]:
             self.fa_suggest.hide()   # bereits übernommen
             return
+        if not rows:
+            self.fa_suggest.hide()
+            self.fa_info.configure(text=f"Kein Auftrag zu „{text}“ (gesucht in FA-Nr., Platinen-Nr., Bezeichnung)",
+                                   text_color=WARN)
+            self.fa_info.pack(fill="x", pady=(4, 0), after=self.fa_entry.master)
+            return
+        self.fa_info.pack_forget()
         w = max((len(a) for _, a, _ in rows), default=0) + 2
         items = [(f"{bel:<7}{art:<{w}}{txt}", (bel, art, txt)) for bel, art, txt in rows]
-        self.fa_suggest.show(items, header="Vorschläge aus der Datenbank  ·  ↑↓ + Enter oder klicken"
-                             if items else None)
+        self.fa_suggest.show(items, header="FA-Nr. · Platinen-Nr. · Bezeichnung  ·  ↑↓ + Enter oder klicken")
 
     def _fa_nav(self, step):
         if self.fa_suggest.visible:
@@ -1096,8 +1104,12 @@ class App:
             return "break"
 
     def _fa_return(self, event=None):
+        text = self.fa_var.get().strip()
         if self.fa_suggest.visible and self.fa_suggest.sel >= 0:
             self.fa_suggest.pick()
+        elif self.fa_suggest.visible and self.fa_suggest.items and \
+                not any(p[0] == text for _, p in self.fa_suggest.items):
+            self.fa_suggest.pick(0)          # kein exakter FA-Treffer (z. B. Suche über Platine) -> obersten nehmen
         else:
             self.fa_suggest.hide()
             self.lookup_auftrag()
@@ -1145,6 +1157,10 @@ class App:
         self.fa_info.pack_forget()
         if not fa:
             self._fa_error("Bitte FA-Nr. eingeben oder scannen")
+            return
+        if not sqldb.is_fa_number(fa):
+            self._fa_error(f"„{fa}“ ist keine FA-Nr. – zum Suchen über Platine/Bezeichnung einen Vorschlag "
+                           f"aus der Liste wählen (Bauteil-Nummern gehören ins Feld „Bauteil“)")
             return
         if not self._sql_ready():
             self._fa_error("Datenbank nicht eingerichtet – Reiter „Einstellungen“ → „Datenbank“")

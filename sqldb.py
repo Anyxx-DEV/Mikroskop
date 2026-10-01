@@ -96,22 +96,38 @@ def connect(server, database, user, password=None, timeout=5, write=False):
     return pyodbc.connect(";".join(parts), timeout=timeout, readonly=not write)
 
 
+def is_fa_number(text):
+    """Bel_Nr ist in der Datenbank eine Zahl (int) -> nur Ziffern sind gültig."""
+    return str(text).strip().isdigit()
+
+
 def lookup_auftrag(cfg, bel_nr):
     """Liefert [(Bel_Nr, ArtikelNr, Artikeltext), ...] für den Fertigungsauftrag."""
+    if not is_fa_number(bel_nr):
+        return []
     with connect(cfg["server"], cfg["database"], cfg["user"]) as conn:
-        rows = conn.cursor().execute(QUERY_AUFTRAG, bel_nr.strip()).fetchall()
+        rows = conn.cursor().execute(QUERY_AUFTRAG, int(bel_nr.strip())).fetchall()
     return [(str(r[0]).strip(), str(r[1] or "").strip(), str(r[2] or "").strip()) for r in rows]
 
 
 # ---------------- Vorschläge beim Tippen ----------------
-# Exakter Treffer zuerst, danach die neuesten Aufträge (höchste Bel_Nr) - die sind am wahrscheinlichsten gemeint.
+# Gesucht wird in FA-Nr. (beginnt mit), Platinen-Nr. (beginnt mit, Leerzeichen egal) und Bezeichnung (enthält).
+# Reihenfolge: exakte FA-Nr., FA-Nr. beginnt mit, dann Treffer über Platine/Bezeichnung - jeweils neueste zuerst.
 QUERY_SUGGEST = """
 SELECT TOP {limit} [Bel_Nr], [Bel_Pos_ArtikelNr], [Bel_Pos_Artikeltext]
 FROM [dbo].[SMD_FA_Fehler]
 WHERE CAST([Bel_Nr] AS nvarchar(50)) LIKE ?
+   OR REPLACE([Bel_Pos_ArtikelNr], ' ', '') LIKE ?
+   OR [Bel_Pos_Artikeltext] LIKE ?
 GROUP BY [Bel_Nr], [Bel_Pos_ArtikelNr], [Bel_Pos_Artikeltext]
-ORDER BY CASE WHEN CAST([Bel_Nr] AS nvarchar(50)) = ? THEN 0 ELSE 1 END, [Bel_Nr] DESC
+ORDER BY CASE WHEN CAST([Bel_Nr] AS nvarchar(50)) = ? THEN 0
+              WHEN CAST([Bel_Nr] AS nvarchar(50)) LIKE ? THEN 1 ELSE 2 END,
+         [Bel_Nr] DESC
 """
+
+
+def _like_escape(text):
+    return re.sub(r"([\[%_])", r"[\1]", text)
 
 _conn = None
 _conn_key = None
@@ -128,16 +144,22 @@ def _cached_connection(cfg):
     return _conn
 
 
-def suggest_auftraege(cfg, prefix, limit=8):
-    """Fertigungsaufträge, deren Bel_Nr mit prefix beginnt: [(Bel_Nr, ArtikelNr, Artikeltext), ...]."""
+def suggest_auftraege(cfg, text, limit=8):
+    """Vorschläge zu FA-Nr., Platinen-Nr. oder Bezeichnung: [(Bel_Nr, ArtikelNr, Artikeltext), ...]."""
     global _conn
-    prefix = prefix.strip()
-    like = re.sub(r"([\[%_])", r"[\1]", prefix) + "%"      # Platzhalterzeichen maskieren
+    text = text.strip()
+    if not text:
+        return []
+    never = "\x01"                                         # Muster, das nie passt
+    fa_like = _like_escape(text) + "%" if is_fa_number(text) else never
+    pl_like = _like_escape(text.replace(" ", "")) + "%"
+    tx_like = "%" + _like_escape(text) + "%" if len(text) >= 2 and not is_fa_number(text) else never
+    params = (fa_like, pl_like, tx_like, text, fa_like)
     sql = QUERY_SUGGEST.format(limit=int(limit))
     with _conn_lock:
         for attempt in (1, 2):
             try:
-                rows = _cached_connection(cfg).cursor().execute(sql, like, prefix).fetchall()
+                rows = _cached_connection(cfg).cursor().execute(sql, *params).fetchall()
                 break
             except Exception:
                 _conn = None            # Verbindung verloren -> einmal neu aufbauen
